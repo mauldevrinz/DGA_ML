@@ -1,0 +1,58 @@
+[package]
+name = "dga-enose"
+version = "1.0.0"
+edition = "2021"
+authors = ["Akhmad Maulvin Nazir Zakaria <maulvin@its.ac.id>"]
+description = "DGA Electronic Nose - Transformer Oil Fault Diagnosis System"
+
+[lib]
+name = "dga_enose_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tauri
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+
+# Machine Learning
+linfa = "0.7"
+linfa-svm = "0.7"
+linfa-trees = "0.7"
+ndarray = { version = "0.16", features = ["serde"] }
+ndarray-stats = "0.6"
+
+# Serial Communication
+serialport = "4"
+
+# CSV
+csv = "1"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+bincode = "1"
+rand = "0.8"
+statrs = "0.17"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

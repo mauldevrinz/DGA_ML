@@ -1,0 +1,112 @@
+.page-container {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.acq-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+.top-controls-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background-color: var(--surface);
+  padding: 12px 20px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+}
+
+.divider-vert {
+  width: 1px;
+  height: 24px;
+  background-color: var(--border);
+  margin: 0 4px;
+}
+
+/* 4x5 Grid Layout */
+.charts-grid-4x5 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  grid-template-rows: repeat(5, 1fr);
+  gap: 16px;
+  flex: 1;
+  position: relative;
+}
+
+.mini-chart-card {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  min-height: 140px; /* Ensure sufficient height for the 4 rows */
+  box-shadow: 0 1px 2px rgba(0,0,0,0.02);
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  margin-bottom: 8px;
+}
+
+.chart-title {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chart-val {
+  font-size: 1.1rem;
+  font-weight: 700;
+  font-family: monospace;
+}
+
+.chart-area {
+  flex: 1;
+  position: relative;
+}
+
+.chart-empty {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.disconnected-overlay {
+  position: absolute;
+  top: 100px;
+  left: 40px;
+  right: 40px;
+  bottom: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(244, 247, 251, 0.7);
+  backdrop-filter: blur(2px);
+  z-index: 10;
+}
+
+.disconnected-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 60px;
+  gap: 16px;
+  color: var(--text-muted);
+  box-shadow: 0 10px 25px rgba(0,0,0,0.1);
+}

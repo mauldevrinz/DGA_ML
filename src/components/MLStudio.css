@@ -1,0 +1,83 @@
+.ml-layout {
+  display: flex;
+  gap: 24px;
+}
+
+.ml-left {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.ml-right {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.list-card {
+  min-height: 250px;
+  display: flex;
+  flex-direction: column;
+}
+
+.empty-box {
+  flex: 1;
+  background-color: var(--bg-color);
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+}
+
+.result-box {
+  background-color: var(--bg-color);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.result-label {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+
+.result-val {
+  font-size: 1.5rem;
+  color: var(--accent-orange);
+  font-weight: 700;
+}
+
+/* Dataset Uploads */
+.dataset-uploads {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.upload-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  background: var(--bg-color);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.btn-sm {
+  padding: 4px 8px;
+  font-size: 0.8rem;
+  display: inline-flex;
+  gap: 6px;
+}
