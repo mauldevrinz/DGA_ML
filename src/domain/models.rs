@@ -6,7 +6,7 @@ use super::enums::{FaultClass, ModelType};
 pub const SENSOR_NAMES: [&str; 17] = [
     "MOS-01", "MOS-02", "MOS-03", "MOS-04", "MOS-05", "MOS-06", "MOS-07",
     "MOS-08", "MOS-09", "MOS-10", "MOS-11", "MOS-12", "MOS-13", "MOS-14",
-    "NDIR", "SHT20-Temp", "SHT20-Humidity",
+    "NDIR", "SHT30-Temp", "SHT30-Humidity",
 ];
 
 /// Feature names for the 15 statistical features extracted per sensor

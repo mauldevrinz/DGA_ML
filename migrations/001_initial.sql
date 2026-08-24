@@ -33,8 +33,8 @@ CREATE TABLE IF NOT EXISTS sensor_data (
     mos_13 REAL NOT NULL DEFAULT 0.0,
     mos_14 REAL NOT NULL DEFAULT 0.0,
     ndir REAL NOT NULL DEFAULT 0.0,
-    sht20_temp REAL NOT NULL DEFAULT 0.0,
-    sht20_humidity REAL NOT NULL DEFAULT 0.0
+    sht30_temp REAL NOT NULL DEFAULT 0.0,
+    sht30_humidity REAL NOT NULL DEFAULT 0.0
 );
 
 -- Extracted feature vectors per session

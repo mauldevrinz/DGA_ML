@@ -15,7 +15,7 @@ impl ExportService {
             "timestamp_ms",
             "mos_01", "mos_02", "mos_03", "mos_04", "mos_05", "mos_06", "mos_07",
             "mos_08", "mos_09", "mos_10", "mos_11", "mos_12", "mos_13", "mos_14",
-            "ndir", "sht20_temp", "sht20_humidity"
+            "ndir", "sht30_temp", "sht30_humidity"
         ])?;
 
         // Write records

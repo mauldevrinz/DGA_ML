@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, Square, Plug, Save, Settings } from 'lucide-react';
 import { useLocalStorage } from '../hooks/useLocalStorage';
 import { LineChart, Line, YAxis, XAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid } from 'recharts';
@@ -12,25 +12,27 @@ const GAS_SENSORS = [
 ];
 
 const GAS_COLORS = [
-  '#ef4444', '#f97316', '#f59e0b', '#84cc16', '#22c55e', '#10b981', 
-  '#14b8a6', '#06b6d4', '#0ea5e9', '#3b82f6', '#6366f1', '#8b5cf6', 
-  '#a855f7', '#d946ef', '#ec4899', '#f43f5e'
+  '#233F7C', '#243F81', '#127BBE', '#2B6CB0', '#3182CE', '#4299E1', 
+  '#75BDE0', '#90CDF4', '#FDBB16', '#F6EC1D', '#D4A017', '#B8860B', 
+  '#233F7C', '#127BBE', '#75BDE0', '#243F81'
 ];
 
 // Reusable small chart component
 const MiniChart = React.memo(({ title, dataKey, color, domain, unit, dataHistory, latestData }) => {
   const latestVal = latestData && latestData[dataKey] !== undefined ? latestData[dataKey] : 0;
+  const decimals = unit === 'mV' ? 4 : 1;
+  const placeholder = unit === 'mV' ? '--.----' : '--.-';
   return (
     <div className="mini-chart-card">
       <div className="chart-header">
         <span className="chart-title">{title}</span>
         <span className="chart-val" style={{ color }}>
-          {latestData && latestData[dataKey] !== undefined ? latestVal.toFixed(1) : '--.-'} {unit}
+          {latestData && latestData[dataKey] !== undefined ? latestVal.toFixed(decimals) : placeholder} {unit}
         </span>
       </div>
-      <div className="chart-area">
+      <div className="chart-area" style={{ minWidth: 0, minHeight: 0 }}>
         {latestData ? (
-          <ResponsiveContainer width="100%" height="100%">
+          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
             <LineChart data={dataHistory}>
               <CartesianGrid strokeDasharray="2 2" vertical={false} stroke="#e2e8f0" />
               <XAxis dataKey="time" hide={true} />
@@ -62,6 +64,16 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   // Serial Port states
   const [serialPort, setSerialPort] = useState(null);
   const [abortController, setAbortController] = useState(null);
+  
+  // Session / Recording states
+  const [sessionName, setSessionName] = useLocalStorage('dga_sessionName', '');
+  const [faultLabel, setFaultLabel] = useLocalStorage('dga_faultLabel', 'Baseline');
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordingStartTime, setRecordingStartTime] = useState(null);
+  const [recordingElapsed, setRecordingElapsed] = useState(0);
+  const [sessionData, setSessionData] = useState([]); // data captured during this recording session
+  const recordingRef = useRef(false); // ref to avoid stale closure in the data capture effect
+  const dataSnapshotIndexRef = useRef(0); // tracks how much of dataHistory we've already captured
   
   // Actuator Modal States
   const [isActuatorModalOpen, setIsActuatorModalOpen] = useState(false);
@@ -99,7 +111,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       const reader = textDecoder.readable.getReader();
       
       let buffer = "";
-      let currentData = { time: 0, temp0: 25.0, temp1: 25.0, hum0: 45.0, hum1: 45.0 };
+      let currentData = { time: 0, temp0: 0.0, temp1: 0.0, hum0: 0.0, hum1: 0.0 };
+      let lastUpdateTime = 0;
       
       try {
         while (true) {
@@ -117,20 +130,39 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             if (match) {
               const adcIndex = parseInt(match[1]);
               const adcValue = parseInt(match[2]);
-              currentData[`mos${adcIndex}`] = adcValue * (4.096 / 32768.0);
+              currentData[`mos${adcIndex}`] = adcValue * (4.096 / 32768.0) * 1000;
+              updated = true;
+            }
+
+            // Match SHT30 Temperature
+            const matchTemp = line.match(/SHT30 Temp\s*=\s*(-?\d+\.\d+)/);
+            if (matchTemp) {
+              currentData.temp0 = parseFloat(matchTemp[1]);
+              updated = true;
+            }
+
+            // Match SHT30 Humidity
+            const matchHumi = line.match(/SHT30 Humi\s*=\s*(\d+\.\d+)/);
+            if (matchHumi) {
+              currentData.hum0 = parseFloat(matchHumi[1]);
               updated = true;
             }
           }
           
           // Only push data to chart when we get the last ADC value (mos15)
           if (updated && currentData.mos15 !== undefined) {
-             setDataHistory(prev => {
-                currentData.time = prev.length > 0 ? prev[prev.length - 1].time + 1 : 1;
-                const next = [...prev, { ...currentData }];
-                return next;
-             });
+             const now = Date.now();
+             // Throttle: update UI only every 1 second
+             if (now - lastUpdateTime >= 1000) {
+               lastUpdateTime = now;
+               setDataHistory(prev => {
+                  currentData.time = prev.length > 0 ? prev[prev.length - 1].time + 1 : 1;
+                  const next = [...prev, { ...currentData }];
+                  return next;
+               });
+             }
              // Reset for next cycle
-             currentData = { time: 0, temp0: 25.0, temp1: 25.0, hum0: 45.0, hum1: 45.0 };
+             currentData = { time: 0, temp0: currentData.temp0, temp1: 0.0, hum0: currentData.hum0, hum1: 0.0 };
           }
         }
       } catch (error) {
@@ -163,6 +195,98 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     } finally {
       setIsConnected(false);
     }
+  };
+
+  // --- Recording logic: capture new dataHistory entries into sessionData ---
+  useEffect(() => {
+    if (!recordingRef.current) return;
+    // Append any new data points that arrived since last snapshot
+    if (dataHistory.length > dataSnapshotIndexRef.current) {
+      const newPoints = dataHistory.slice(dataSnapshotIndexRef.current);
+      setSessionData(prev => [...prev, ...newPoints]);
+      dataSnapshotIndexRef.current = dataHistory.length;
+    }
+  }, [dataHistory]);
+
+  // --- Elapsed timer ---
+  useEffect(() => {
+    if (!isRecording || !recordingStartTime) return;
+    const interval = setInterval(() => {
+      setRecordingElapsed(Math.floor((Date.now() - recordingStartTime) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [isRecording, recordingStartTime]);
+
+  // --- Start / Stop System ---
+  const handleStartSystem = useCallback(() => {
+    if (!isConnected) {
+      alert('Please connect to a serial port first before starting a session.');
+      return;
+    }
+    if (!sessionName.trim()) {
+      alert('Please enter a Session Name before starting.');
+      return;
+    }
+
+    if (!isRecording) {
+      // START recording
+      setSessionData([]);
+      dataSnapshotIndexRef.current = dataHistory.length; // start from current position
+      setRecordingStartTime(Date.now());
+      setRecordingElapsed(0);
+      setIsRecording(true);
+      recordingRef.current = true;
+    } else {
+      // STOP recording
+      setIsRecording(false);
+      recordingRef.current = false;
+      setRecordingStartTime(null);
+    }
+  }, [isConnected, isRecording, sessionName, dataHistory.length]);
+
+  // --- Save Data as CSV ---
+  const handleSaveData = useCallback(() => {
+    if (sessionData.length === 0) {
+      alert('No data to save. Start a recording session and collect some data first.');
+      return;
+    }
+
+    // Build CSV
+    const sensorHeaders = GAS_SENSORS.map((_, i) => `mos${i}_mV`);
+    const headers = ['time', ...sensorHeaders, 'temp_chamber_C', 'temp_oil_C', 'humidity_chamber_pct', 'humidity_oil_pct'];
+    const csvRows = [headers.join(',')];
+
+    for (const point of sessionData) {
+      const row = [
+        point.time ?? '',
+        ...GAS_SENSORS.map((_, i) => (point[`mos${i}`] ?? '').toString()),
+        (point.temp0 ?? '').toString(),
+        (point.temp1 ?? '').toString(),
+        (point.hum0 ?? '').toString(),
+        (point.hum1 ?? '').toString(),
+      ];
+      csvRows.push(row.join(','));
+    }
+
+    const csvString = csvRows.join('\n');
+    const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const safeName = sessionName.trim().replace(/[^a-zA-Z0-9_-]/g, '_') || 'session';
+    a.href = url;
+    a.download = `DGA_${safeName}_${faultLabel}_${timestamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [sessionData, sessionName, faultLabel]);
+
+  // --- Format elapsed time ---
+  const formatElapsed = (secs) => {
+    const m = Math.floor(secs / 60).toString().padStart(2, '0');
+    const s = (secs % 60).toString().padStart(2, '0');
+    return `${m}:${s}`;
   };
 
   const latestData = dataHistory.length > 0 ? dataHistory[dataHistory.length - 1] : null;
@@ -198,19 +322,45 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
           <div className="divider-vert"></div>
 
-          <input type="text" className="select-input" placeholder="Session Name" style={{ width: '200px' }} />
-          <select className="select-input" style={{ width: '150px' }}>
-            <option>Baseline</option>
-            <option>Normal</option>
-            <option>Overheating</option>
-            <option>Arcing</option>
+          <input 
+            type="text" 
+            className="select-input" 
+            placeholder="Session Name" 
+            style={{ width: '200px', borderColor: isRecording ? 'var(--accent-orange)' : undefined }} 
+            value={sessionName}
+            onChange={(e) => setSessionName(e.target.value)}
+            disabled={isRecording}
+          />
+          <select 
+            className="select-input" 
+            style={{ width: '150px' }}
+            value={faultLabel}
+            onChange={(e) => setFaultLabel(e.target.value)}
+            disabled={isRecording}
+          >
+            <option value="Baseline">Baseline</option>
+            <option value="Normal">Normal</option>
+            <option value="Overheating">Overheating</option>
+            <option value="Arcing">Arcing</option>
           </select>
 
-          <button className="btn btn-primary">
-            <Play size={16} /> Start System
-          </button>
-          <button className="btn btn-primary">
-            <Save size={16} /> Save Data
+          {!isRecording ? (
+            <button className="btn btn-primary" onClick={handleStartSystem} title="Start recording session">
+              <Play size={16} /> Start System
+            </button>
+          ) : (
+            <button className="btn btn-danger" onClick={handleStartSystem} title="Stop recording session">
+              <Square size={16} /> Stop ({formatElapsed(recordingElapsed)}) — {sessionData.length} pts
+            </button>
+          )}
+          <button 
+            className="btn btn-primary" 
+            onClick={handleSaveData} 
+            disabled={sessionData.length === 0}
+            title={sessionData.length === 0 ? 'No data recorded yet' : `Save ${sessionData.length} data points as CSV`}
+            style={{ opacity: sessionData.length === 0 ? 0.5 : 1 }}
+          >
+            <Save size={16} /> Save Data{sessionData.length > 0 ? ` (${sessionData.length})` : ''}
           </button>
           <button className="btn btn-secondary" onClick={() => setIsActuatorModalOpen(true)}>
             <Settings size={16} /> Actuator Control
@@ -239,8 +389,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               title={name}
               dataKey={`mos${i}`}
               color="var(--accent-orange)"
-              domain={[0, 5]} // Static Y-Axis 0-5 V
-              unit="V"
+              domain={['auto', 'auto']} // Dynamic Y-Axis, auto-scale to baseline & max
+              unit="mV"
               dataHistory={dataHistory}
               latestData={latestData}
             />
@@ -293,16 +443,16 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             <div className="chart-header" style={{ marginBottom: '10px' }}>
               <span className="chart-title" style={{ fontSize: '18px' }}>Combined Gas Sensors Trend (mV)</span>
             </div>
-            <div className="chart-area" style={{ flex: 1 }}>
+            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
               {latestData ? (
-                <ResponsiveContainer width="100%" height="100%">
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
                   <LineChart data={dataHistory} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#334155" />
-                    <XAxis dataKey="time" stroke="#94a3b8" />
-                    <YAxis domain={[0, 5]} stroke="#94a3b8" />
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
+                    <XAxis dataKey="time" stroke="#75BDE0" />
+                    <YAxis domain={[0, 5000]} stroke="#75BDE0" />
                     <Tooltip 
-                      contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', color: '#f8fafc' }}
-                      itemStyle={{ color: '#e2e8f0' }}
+                      contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
+                      itemStyle={{ color: '#ffffff' }}
                     />
                     <Legend wrapperStyle={{ paddingTop: '20px' }} />
                     {GAS_SENSORS.map((name, i) => (
@@ -409,7 +559,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <div>
                     <span style={{ display: 'block', fontSize: '12px', color: '#64748b' }}>Current Phase:</span>
-                    <strong style={{ color: autoPhase === 'stopped' ? '#94a3b8' : '#ea580c' }}>
+                    <strong style={{ color: autoPhase === 'stopped' ? '#94a3b8' : '#FDBB16' }}>
                       {autoPhase.toUpperCase()}
                     </strong>
                   </div>

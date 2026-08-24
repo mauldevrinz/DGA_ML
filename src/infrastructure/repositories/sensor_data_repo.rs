@@ -24,7 +24,7 @@ impl SqliteSensorDataRepo {
                 "INSERT INTO sensor_data (session_id, timestamp_ms,
                  mos_01, mos_02, mos_03, mos_04, mos_05, mos_06, mos_07,
                  mos_08, mos_09, mos_10, mos_11, mos_12, mos_13, mos_14,
-                 ndir, sht20_temp, sht20_humidity)
+                 ndir, sht30_temp, sht30_humidity)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(session_id)
@@ -48,7 +48,7 @@ impl SqliteSensorDataRepo {
             "SELECT timestamp_ms,
              mos_01, mos_02, mos_03, mos_04, mos_05, mos_06, mos_07,
              mos_08, mos_09, mos_10, mos_11, mos_12, mos_13, mos_14,
-             ndir, sht20_temp, sht20_humidity
+             ndir, sht30_temp, sht30_humidity
              FROM sensor_data WHERE session_id = ? ORDER BY timestamp_ms ASC"
         )
         .bind(session_id)
@@ -64,7 +64,7 @@ impl SqliteSensorDataRepo {
             "SELECT timestamp_ms,
              mos_01, mos_02, mos_03, mos_04, mos_05, mos_06, mos_07,
              mos_08, mos_09, mos_10, mos_11, mos_12, mos_13, mos_14,
-             ndir, sht20_temp, sht20_humidity
+             ndir, sht30_temp, sht30_humidity
              FROM sensor_data WHERE session_id = ?
              ORDER BY timestamp_ms DESC LIMIT ?"
         )
@@ -96,7 +96,7 @@ struct SensorRow {
     mos_09: f64, mos_10: f64, mos_11: f64, mos_12: f64,
     mos_13: f64, mos_14: f64,
     ndir: f64,
-    sht20_temp: f64, sht20_humidity: f64,
+    sht30_temp: f64, sht30_humidity: f64,
 }
 
 impl SensorRow {
@@ -108,7 +108,7 @@ impl SensorRow {
                 self.mos_05, self.mos_06, self.mos_07, self.mos_08,
                 self.mos_09, self.mos_10, self.mos_11, self.mos_12,
                 self.mos_13, self.mos_14, self.ndir,
-                self.sht20_temp, self.sht20_humidity,
+                self.sht30_temp, self.sht30_humidity,
             ],
         }
     }

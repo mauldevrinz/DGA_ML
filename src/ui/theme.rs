@@ -22,8 +22,8 @@ pub const ACCENT_PURPLE: Color32 = Color32::from_rgb(138, 92, 246);
 pub const ACCENT_INDIGO: Color32 = Color32::from_rgb(99, 102, 241);
 
 // Status colors
-pub const STATUS_NORMAL: Color32 = Color32::from_rgb(34, 197, 94);
-pub const STATUS_WARN: Color32 = Color32::from_rgb(250, 180, 20);
+pub const STATUS_NORMAL: Color32 = Color32::from_rgb(117, 189, 224);
+pub const STATUS_WARN: Color32 = Color32::from_rgb(18, 123, 190);
 pub const STATUS_ERROR: Color32 = Color32::from_rgb(239, 68, 68);
 pub const STATUS_INFO: Color32 = Color32::from_rgb(56, 189, 248);
 

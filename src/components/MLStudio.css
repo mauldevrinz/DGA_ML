@@ -1,18 +1,25 @@
 .ml-layout {
   display: flex;
   gap: 24px;
+  align-items: stretch;
 }
 
 .ml-left {
-  flex: 1;
+  flex: 4;
   display: flex;
   flex-direction: column;
 }
 
 .ml-right {
-  flex: 1;
+  flex: 5;
   display: flex;
   flex-direction: column;
+}
+
+/* Make the last card in each column stretch to fill remaining space */
+.ml-left > .card:last-child,
+.ml-right > :last-child {
+  flex: 1;
 }
 
 .list-card {

@@ -1,5 +1,5 @@
 #![allow(dead_code)]
-use egui::{Ui, RichText, Image, Color32, Layout, Align};
+use egui::{Ui, RichText, Color32, Layout, Align};
 use crate::ui::theme;
 
 pub fn render(ui: &mut Ui) {
@@ -13,7 +13,8 @@ pub fn render(ui: &mut Ui) {
                 let logo_height = 120.0;
                 
                 // Left Logo
-                ui.add(Image::new(egui::include_image!("../../LOGO ITS.png")).max_height(logo_height));
+                // ui.add(Image::new(egui::include_image!("../../LOGO ITS.png")).max_height(logo_height));
+                ui.add_space(100.0);
                 
                 // Center Title (dynamically takes up available space minus the right logo)
                 let text_width = ui.available_width() - 140.0;
@@ -31,7 +32,8 @@ pub fn render(ui: &mut Ui) {
 
                 // Right Logo
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.add(Image::new(egui::include_image!("../../ELKA LOGO.jpg")).max_height(logo_height));
+                    // ui.add(Image::new(egui::include_image!("../../ELKA LOGO.jpg")).max_height(logo_height));
+                    ui.add_space(100.0);
                 });
             });
 
@@ -45,12 +47,13 @@ pub fn render(ui: &mut Ui) {
                 
                 // Profile Picture
                 let profile_size = 240.0;
-                ui.add(
-                    Image::new(egui::include_image!("../../Profile.jpeg"))
-                        .max_height(profile_size)
-                        .max_width(profile_size)
-                        .corner_radius(12.0)
-                );
+                // ui.add(
+                //     Image::new(egui::include_image!("../../Profile.jpeg"))
+                //         .max_height(profile_size)
+                //         .max_width(profile_size)
+                //         .corner_radius(12.0)
+                // );
+                ui.add_space(profile_size);
                 
                 ui.add_space(60.0);
 

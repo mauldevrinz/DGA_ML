@@ -7,6 +7,22 @@
     "core:default",
     "shell:allow-open",
     "dialog:default",
-    "fs:default"
+    "fs:default",
+    {
+      "identifier": "fs:allow-mkdir",
+      "allow": [{ "path": "$RESOURCE/../Data/**" }]
+    },
+    {
+      "identifier": "fs:allow-write-text-file",
+      "allow": [{ "path": "$RESOURCE/../Data/**" }]
+    },
+    {
+      "identifier": "fs:allow-exists",
+      "allow": [{ "path": "$RESOURCE/../Data/**" }]
+    },
+    {
+      "identifier": "fs:allow-read-dir",
+      "allow": [{ "path": "$RESOURCE/../Data/**" }]
+    }
   ]
 }

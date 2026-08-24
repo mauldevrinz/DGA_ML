@@ -12,20 +12,26 @@
   --text-secondary: #475569;
   --text-muted: #94a3b8;
 
-  /* Theme Colors: Orange, Blue, White */
-  --accent-orange: #262364;
-  --accent-orange-hover: #1e1b4f;
-  --accent-blue: #0ea5e9;
-  --accent-blue-hover: #0284c7;
+  /* ITS Blue Palette Only */
+  --its-biru-tua: #233F7C;
+  --its-biru-cover: #243F81;
+  --its-biru-tua-lambang: #127BBE;
+  --its-biru-muda-lambang: #75BDE0;
 
-  --status-normal: #10b981;
-  --status-warn: #f59e0b;
+  /* Theme Colors */
+  --accent-orange: var(--its-biru-tua-lambang);
+  --accent-orange-hover: var(--its-biru-tua);
+  --accent-blue: var(--its-biru-tua-lambang);
+  --accent-blue-hover: var(--its-biru-tua);
+
+  --status-normal: var(--its-biru-muda-lambang);
+  --status-warn: var(--its-biru-tua-lambang);
   --status-error: #ef4444;
-  --status-info: #0ea5e9;
+  --status-info: var(--its-biru-tua-lambang);
 
-  --sidebar-hover: #f1f5f9;
-  --sidebar-active: #f3e8ff; /* Light purple tint */
-  --sidebar-active-border: var(--accent-orange);
+  --sidebar-hover: rgba(255, 255, 255, 0.1);
+  --sidebar-active: rgba(117, 189, 224, 0.2);
+  --sidebar-active-border: var(--its-biru-muda-lambang);
 }
 
 * {
@@ -35,7 +41,7 @@
 }
 
 body {
-  font-family: 'Inter', system-ui, Avenir, Helvetica, Arial, sans-serif;
+  font-family: 'Work Sans', system-ui, Avenir, Helvetica, Arial, sans-serif;
   background-color: var(--bg-color);
   color: var(--text-primary);
   line-height: 1.5;
@@ -144,8 +150,8 @@ button {
 
 .status-badge.connected {
   color: var(--status-normal);
-  border-color: rgba(16, 185, 129, 0.3);
-  background-color: rgba(16, 185, 129, 0.05);
+  border-color: rgba(117, 189, 224, 0.3);
+  background-color: rgba(117, 189, 224, 0.05);
 }
 
 .status-badge.disconnected {
@@ -160,7 +166,7 @@ button {
 
 .sidebar {
   width: 240px;
-  background-color: #262364;
+  background-color: var(--its-biru-tua);
   border-right: none;
   display: flex;
   flex-direction: column;
@@ -264,12 +270,12 @@ button {
 }
 
 .btn-primary {
-  background-color: var(--accent-orange);
-  color: white;
+  background-color: var(--its-biru-tua);
+  color: #ffffff;
 }
 
 .btn-primary:hover {
-  background-color: var(--accent-orange-hover);
+  background-color: var(--its-biru-cover);
 }
 
 .btn-secondary {
@@ -304,7 +310,7 @@ button {
 /* Grid Layouts */
 .grid-2-col {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 24px;
 }
 

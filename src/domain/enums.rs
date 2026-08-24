@@ -62,8 +62,8 @@ impl FaultClass {
     pub fn color(&self) -> egui::Color32 {
         match self {
             FaultClass::Baseline => egui::Color32::from_rgb(107, 114, 128),   // Gray
-            FaultClass::Normal => egui::Color32::from_rgb(34, 197, 94),       // Green
-            FaultClass::Overheating => egui::Color32::from_rgb(234, 179, 8),  // Yellow
+            FaultClass::Normal => egui::Color32::from_rgb(18, 123, 190),      // Blue
+            FaultClass::Overheating => egui::Color32::from_rgb(35, 63, 124),  // Dark Blue
             FaultClass::Arcing => egui::Color32::from_rgb(239, 68, 68),       // Red
         }
     }
@@ -149,8 +149,8 @@ impl ConnectionStatus {
     pub fn color(&self) -> egui::Color32 {
         match self {
             ConnectionStatus::Disconnected => egui::Color32::from_rgb(107, 114, 128),
-            ConnectionStatus::Connecting => egui::Color32::from_rgb(234, 179, 8),
-            ConnectionStatus::Connected => egui::Color32::from_rgb(34, 197, 94),
+            ConnectionStatus::Connecting => egui::Color32::from_rgb(117, 189, 224),
+            ConnectionStatus::Connected => egui::Color32::from_rgb(18, 123, 190),
             ConnectionStatus::Error => egui::Color32::from_rgb(239, 68, 68),
         }
     }
