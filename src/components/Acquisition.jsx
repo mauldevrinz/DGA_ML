@@ -64,6 +64,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   // Serial Port states
   const [serialPort, setSerialPort] = useState(null);
   const [abortController, setAbortController] = useState(null);
+
+  // Peltier setpoint control
+  const [setpointInput, setSetpointInput] = useState('25.0');
   
   // Session / Recording states
   const [sessionName, setSessionName] = useLocalStorage('dga_sessionName', '');
@@ -111,7 +114,12 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       const reader = textDecoder.readable.getReader();
       
       let buffer = "";
-      let currentData = { time: 0, temp0: 0.0, temp1: 0.0, hum0: 0.0, hum1: 0.0 };
+      let currentData = {
+        time: 0, temp0: 0.0, temp1: 0.0, hum0: 0.0, hum1: 0.0,
+        ina1_v: 0.0, ina1_i: 0.0, ina1_p: 0.0,
+        ina2_v: 0.0, ina2_i: 0.0, ina2_p: 0.0,
+        setpoint_c: undefined, peltier_mode: undefined,
+      };
       let lastUpdateTime = 0;
       
       try {
@@ -147,6 +155,55 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               currentData.hum0 = parseFloat(matchHumi[1]);
               updated = true;
             }
+
+            // Match SHT31 Temperature (oil vessel)
+            const matchTemp31 = line.match(/SHT31 Temp\s*=\s*(-?\d+\.\d+)/);
+            if (matchTemp31) {
+              currentData.temp1 = parseFloat(matchTemp31[1]);
+              updated = true;
+            }
+
+            // Match SHT31 Humidity (oil vessel)
+            const matchHumi31 = line.match(/SHT31 Humi\s*=\s*(\d+\.\d+)/);
+            if (matchHumi31) {
+              currentData.hum1 = parseFloat(matchHumi31[1]);
+              updated = true;
+            }
+
+            // Match Peltier setpoint readback, e.g. "SETPOINT = 25.00 C" or
+            // the confirmation echo "ACK SETPOINT = 25.00 C"
+            const matchSetpoint = line.match(/^(?:ACK )?SETPOINT\s*=\s*(-?\d+\.\d+)/);
+            if (matchSetpoint) {
+              currentData.setpoint_c = parseFloat(matchSetpoint[1]);
+              updated = true;
+            }
+
+            // Match Peltier control mode, e.g. "PELTIER_MODE = COOL"
+            const matchPeltierMode = line.match(/PELTIER_MODE\s*=\s*(\w+)/);
+            if (matchPeltierMode) {
+              currentData.peltier_mode = matchPeltierMode[1];
+              updated = true;
+            }
+
+            // Match INA226 current sensor line, e.g.:
+            // "INA226_1 Vbus = 12.345 V, Vshunt = 0.01234 V, I = 1.2345 A, P = 15.4321 W"
+            const matchIna = line.match(/INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.\d+)\s*V,\s*Vshunt\s*=\s*(-?\d+\.\d+)\s*V,\s*I\s*=\s*(-?\d+\.\d+)\s*A,\s*P\s*=\s*(-?\d+\.\d+)\s*W/);
+            if (matchIna) {
+              const inaIndex = parseInt(matchIna[1]);
+              const vbus = parseFloat(matchIna[2]);
+              const current = parseFloat(matchIna[4]) * 1000; // A -> mA
+              const power = parseFloat(matchIna[5]);
+              if (inaIndex === 1) {
+                currentData.ina1_v = vbus;
+                currentData.ina1_i = current;
+                currentData.ina1_p = power;
+              } else if (inaIndex === 2) {
+                currentData.ina2_v = vbus;
+                currentData.ina2_i = current;
+                currentData.ina2_p = power;
+              }
+              updated = true;
+            }
           }
           
           // Only push data to chart when we get the last ADC value (mos15)
@@ -161,8 +218,14 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                   return next;
                });
              }
-             // Reset for next cycle
-             currentData = { time: 0, temp0: currentData.temp0, temp1: 0.0, hum0: currentData.hum0, hum1: 0.0 };
+             // Reset for next cycle (carry forward values that update at a slower cadence)
+             currentData = {
+               time: 0, temp0: currentData.temp0, temp1: currentData.temp1,
+               hum0: currentData.hum0, hum1: currentData.hum1,
+               ina1_v: currentData.ina1_v, ina1_i: currentData.ina1_i, ina1_p: currentData.ina1_p,
+               ina2_v: currentData.ina2_v, ina2_i: currentData.ina2_i, ina2_p: currentData.ina2_p,
+               setpoint_c: currentData.setpoint_c, peltier_mode: currentData.peltier_mode,
+             };
           }
         }
       } catch (error) {
@@ -196,6 +259,28 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       setIsConnected(false);
     }
   };
+
+  // --- Send temperature setpoint to the Teensy (Peltier bang-bang controller) ---
+  const sendSetpoint = useCallback(async () => {
+    if (!serialPort || !serialPort.writable) {
+      alert('Please connect to a serial port first.');
+      return;
+    }
+    const value = parseFloat(setpointInput);
+    if (Number.isNaN(value)) {
+      alert('Enter a valid setpoint temperature.');
+      return;
+    }
+
+    const writer = serialPort.writable.getWriter();
+    try {
+      await writer.write(new TextEncoder().encode(`SETPOINT=${value.toFixed(2)}\n`));
+    } catch (e) {
+      console.error(e);
+    } finally {
+      writer.releaseLock();
+    }
+  }, [serialPort, setpointInput]);
 
   // --- Recording logic: capture new dataHistory entries into sessionData ---
   useEffect(() => {
@@ -253,7 +338,12 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
     // Build CSV
     const sensorHeaders = GAS_SENSORS.map((_, i) => `mos${i}_mV`);
-    const headers = ['time', ...sensorHeaders, 'temp_chamber_C', 'temp_oil_C', 'humidity_chamber_pct', 'humidity_oil_pct'];
+    const headers = [
+      'time', ...sensorHeaders,
+      'temp_chamber_C', 'temp_oil_C', 'humidity_chamber_pct', 'humidity_oil_pct',
+      'ina226_1_vbus_V', 'ina226_1_current_mA', 'ina226_1_power_W',
+      'ina226_2_vbus_V', 'ina226_2_current_mA', 'ina226_2_power_W',
+    ];
     const csvRows = [headers.join(',')];
 
     for (const point of sessionData) {
@@ -264,6 +354,12 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         (point.temp1 ?? '').toString(),
         (point.hum0 ?? '').toString(),
         (point.hum1 ?? '').toString(),
+        (point.ina1_v ?? '').toString(),
+        (point.ina1_i ?? '').toString(),
+        (point.ina1_p ?? '').toString(),
+        (point.ina2_v ?? '').toString(),
+        (point.ina2_i ?? '').toString(),
+        (point.ina2_p ?? '').toString(),
       ];
       csvRows.push(row.join(','));
     }
@@ -426,12 +522,50 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             dataHistory={dataHistory}
             latestData={latestData}
           />
-          <MiniChart 
+          <MiniChart
             title="HUM OIL VESSEL"
             dataKey="hum1"
             color="var(--status-normal)"
             domain={[0, 100]}
             unit="%"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+
+          {/* INA226 Current Sensors */}
+          <MiniChart
+            title="INA226 #1 CURRENT"
+            dataKey="ina1_i"
+            color="var(--accent-orange)"
+            domain={['auto', 'auto']}
+            unit="mA"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="INA226 #1 VOLTAGE"
+            dataKey="ina1_v"
+            color="var(--accent-blue)"
+            domain={['auto', 'auto']}
+            unit="V"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="INA226 #2 CURRENT"
+            dataKey="ina2_i"
+            color="var(--accent-orange)"
+            domain={['auto', 'auto']}
+            unit="mA"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="INA226 #2 VOLTAGE"
+            dataKey="ina2_v"
+            color="var(--accent-blue)"
+            domain={['auto', 'auto']}
+            unit="V"
             dataHistory={dataHistory}
             latestData={latestData}
           />
@@ -501,6 +635,48 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
             <div className="mini-chart-card" style={{ flex: 1 }}>
               <div className="chart-header">
+                <span className="chart-title">Peltier Control (Chamber)</span>
+              </div>
+              <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>SETPOINT:</span>
+                  <span style={{ color: 'var(--accent-blue)', fontWeight: 'bold' }}>
+                    {latestData && latestData.setpoint_c !== undefined ? latestData.setpoint_c.toFixed(2) : '--.--'} °C
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>MODE:</span>
+                  <span style={{
+                    color: latestData && latestData.peltier_mode === 'COOL' ? 'var(--accent-blue)' : 'var(--text-muted)',
+                    fontWeight: 'bold'
+                  }}>
+                    {latestData && latestData.peltier_mode ? latestData.peltier_mode : '--'}
+                  </span>
+                </div>
+                <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                  <input
+                    type="number"
+                    step="0.1"
+                    className="select-input"
+                    style={{ flex: 1 }}
+                    value={setpointInput}
+                    onChange={(e) => setSetpointInput(e.target.value)}
+                    placeholder="Setpoint °C"
+                  />
+                  <button
+                    className="btn btn-primary"
+                    onClick={sendSetpoint}
+                    disabled={!isConnected}
+                    title={!isConnected ? 'Connect to serial first' : 'Send setpoint to Teensy'}
+                  >
+                    Set
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            <div className="mini-chart-card" style={{ flex: 1 }}>
+              <div className="chart-header">
                 <span className="chart-title">Oil Vessel Conditions</span>
               </div>
               <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
@@ -514,6 +690,30 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                   <span style={{ color: 'var(--text-muted)' }}>HUM OIL VESSEL:</span>
                   <span style={{ color: 'var(--status-normal)', fontWeight: 'bold' }}>
                     {latestData && latestData.hum1 !== undefined ? latestData.hum1.toFixed(2) : '--.--'} %
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="mini-chart-card" style={{ flex: 1 }}>
+              <div className="chart-header">
+                <span className="chart-title">Current Sensors (INA226)</span>
+              </div>
+              <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>INA226 #1 (I / V):</span>
+                  <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
+                    {latestData && latestData.ina1_i !== undefined ? latestData.ina1_i.toFixed(2) : '--.--'} mA
+                    {' / '}
+                    {latestData && latestData.ina1_v !== undefined ? latestData.ina1_v.toFixed(3) : '--.---'} V
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>INA226 #2 (I / V):</span>
+                  <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
+                    {latestData && latestData.ina2_i !== undefined ? latestData.ina2_i.toFixed(2) : '--.--'} mA
+                    {' / '}
+                    {latestData && latestData.ina2_v !== undefined ? latestData.ina2_v.toFixed(3) : '--.---'} V
                   </span>
                 </div>
               </div>
