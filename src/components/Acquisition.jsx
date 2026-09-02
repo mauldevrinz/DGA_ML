@@ -11,10 +11,13 @@ const GAS_SENSORS = [
   "IR12EM ACT", "IR12EM REF"
 ];
 
+// 16 distinct, high-contrast hues (evenly spaced around the color wheel,
+// alternating lightness) so no two sensor lines ever share a color.
 const GAS_COLORS = [
-  '#233F7C', '#243F81', '#127BBE', '#2B6CB0', '#3182CE', '#4299E1', 
-  '#75BDE0', '#90CDF4', '#FDBB16', '#F6EC1D', '#D4A017', '#B8860B', 
-  '#233F7C', '#127BBE', '#75BDE0', '#243F81'
+  '#C81C1C', '#E27636', '#C89D1C', '#CCE236',
+  '#72C81C', '#4BE236', '#1CC847', '#36E2A1',
+  '#1CC8C8', '#36A1E2', '#1C47C8', '#4B36E2',
+  '#721CC8', '#CC36E2', '#C81C9D', '#E23676'
 ];
 
 // Reusable small chart component
@@ -37,13 +40,14 @@ const MiniChart = React.memo(({ title, dataKey, color, domain, unit, dataHistory
               <CartesianGrid strokeDasharray="2 2" vertical={false} stroke="#e2e8f0" />
               <XAxis dataKey="time" hide={true} />
               <YAxis domain={domain} width={30} tick={{ fontSize: 10 }} />
-              <Line 
-                type="monotone" 
-                dataKey={dataKey} 
-                stroke={color} 
-                strokeWidth={2} 
-                dot={false} 
-                isAnimationActive={false} 
+              <Line
+                type="monotone"
+                dataKey={dataKey}
+                stroke={color}
+                strokeWidth={2}
+                dot={false}
+                isAnimationActive={false}
+                connectNulls={true}
               />
             </LineChart>
           </ResponsiveContainer>
@@ -63,6 +67,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   
   // Serial Port states
   const [serialPort, setSerialPort] = useState(null);
+  const serialPortRef = useRef(null);
   const [abortController, setAbortController] = useState(null);
 
   // Peltier setpoint control
@@ -78,14 +83,26 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   const recordingRef = useRef(false); // ref to avoid stale closure in the data capture effect
   const dataSnapshotIndexRef = useRef(0); // tracks how much of dataHistory we've already captured
   
-  // Actuator Modal States
-  const [isActuatorModalOpen, setIsActuatorModalOpen] = useState(false);
-  const [actuatorMode, setActuatorMode] = useLocalStorage('dga_actuatorMode', 'auto'); // 'auto' | 'manual'
-  const [autoPhase, setAutoPhase] = useState('stopped'); // 'stopped' | 'idle' | 'injecting' | 'purging'
-  const [manualFreshAir, setManualFreshAir] = useLocalStorage('dga_manualFreshAir', false);
-  const [manualGasInlet, setManualGasInlet] = useLocalStorage('dga_manualGasInlet', false);
-  const [manualGasOutlet, setManualGasOutlet] = useLocalStorage('dga_manualGasOutlet', false);
-  
+
+  // ===== SYSTEM PHASE SETTINGS POPUP =====
+  const [showSystemPopup, setShowSystemPopup] = useState(false);
+  const [idleDuration, setIdleDuration] = useLocalStorage('dga_idleDuration', 2);   // minutes
+  const [injectDuration, setInjectDuration] = useLocalStorage('dga_injectDuration', 5); // minutes
+  const [purgeDuration, setPurgeDuration] = useLocalStorage('dga_purgeDuration', 4);  // minutes
+  const [pump1Pwm, setPump1Pwm] = useLocalStorage('dga_pump1Pwm', 50); // percentage 0-100
+
+  // ===== SYSTEM RUN STATE =====
+  const [systemRunning, setSystemRunning] = useState(false);
+  const [currentPhase, setCurrentPhase] = useState(''); // 'IDLE' | 'INJECT' | 'PURGE' | ''
+  const [phaseTimeLeft, setPhaseTimeLeft] = useState(0); // seconds remaining in current phase
+  const systemTimerRef = useRef(null);
+  const phaseQueueRef = useRef([]); // queue of {phase, durationSec}
+  const phaseStartTimeRef = useRef(null);
+  const phaseDurationRef = useRef(0);
+
+  // ===== SAVE POPUP after system completes =====
+  const [showSavePopup, setShowSavePopup] = useState(false);
+
   useEffect(() => {
     setPorts([
       { name: 'Web Serial API', description: 'Teensy 4.1 USB Serial', is_teensy: true },
@@ -93,27 +110,17 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     setSelectedPort('Web Serial API');
   }, []);
 
-  const connectSerial = async () => {
+  const connectSerial = () => {
     try {
-      if (!('serial' in navigator)) {
-        alert("Web Serial API is not supported in this browser. Please use Chrome or Edge.");
-        return;
-      }
+      const host = window.location.hostname || '127.0.0.1';
+      const ws = new WebSocket(`ws://${host}:8080`);
+      setSerialPort(ws);
+      serialPortRef.current = ws;
       
-      const port = await navigator.serial.requestPort();
-      await port.open({ baudRate: 115200 });
-      setSerialPort(port);
-      setIsConnected(true);
+      ws.onopen = () => {
+        setIsConnected(true);
+      };
       
-      const ac = new AbortController();
-      setAbortController(ac);
-      
-      // Use pipeTo with AbortController signal so we can cleanly abort
-      const textDecoder = new TextDecoderStream();
-      const pipeDone = port.readable.pipeTo(textDecoder.writable, { signal: ac.signal }).catch(() => {});
-      const reader = textDecoder.readable.getReader();
-      
-      let buffer = "";
       let currentData = {
         time: 0, temp0: 0.0, temp1: 0.0, hum0: 0.0, hum1: 0.0,
         ina1_v: 0.0, ina1_i: 0.0, ina1_p: 0.0,
@@ -122,148 +129,131 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       };
       let lastUpdateTime = 0;
       
-      try {
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          
-          buffer += value;
-          let lines = buffer.split('\n');
-          buffer = lines.pop(); // Keep incomplete line
-          
-          let updated = false;
-          for (let line of lines) {
-            // Match pattern like "ADC0 = 1234" or "ADC0 = -1234"
-            const match = line.match(/ADC(\d+)\s*=\s*(-?\d+)/);
-            if (match) {
-              const adcIndex = parseInt(match[1]);
-              const adcValue = parseInt(match[2]);
-              currentData[`mos${adcIndex}`] = adcValue * (4.096 / 32768.0) * 1000;
-              updated = true;
-            }
+      ws.onmessage = (event) => {
+        const line = event.data;
+        let updated = false;
 
-            // Match SHT30 Temperature
-            const matchTemp = line.match(/SHT30 Temp\s*=\s*(-?\d+\.\d+)/);
-            if (matchTemp) {
-              currentData.temp0 = parseFloat(matchTemp[1]);
-              updated = true;
-            }
-
-            // Match SHT30 Humidity
-            const matchHumi = line.match(/SHT30 Humi\s*=\s*(\d+\.\d+)/);
-            if (matchHumi) {
-              currentData.hum0 = parseFloat(matchHumi[1]);
-              updated = true;
-            }
-
-            // Match SHT31 Temperature (oil vessel)
-            const matchTemp31 = line.match(/SHT31 Temp\s*=\s*(-?\d+\.\d+)/);
-            if (matchTemp31) {
-              currentData.temp1 = parseFloat(matchTemp31[1]);
-              updated = true;
-            }
-
-            // Match SHT31 Humidity (oil vessel)
-            const matchHumi31 = line.match(/SHT31 Humi\s*=\s*(\d+\.\d+)/);
-            if (matchHumi31) {
-              currentData.hum1 = parseFloat(matchHumi31[1]);
-              updated = true;
-            }
-
-            // Match Peltier setpoint readback, e.g. "SETPOINT = 25.00 C" or
-            // the confirmation echo "ACK SETPOINT = 25.00 C"
-            const matchSetpoint = line.match(/^(?:ACK )?SETPOINT\s*=\s*(-?\d+\.\d+)/);
-            if (matchSetpoint) {
-              currentData.setpoint_c = parseFloat(matchSetpoint[1]);
-              updated = true;
-            }
-
-            // Match Peltier control mode, e.g. "PELTIER_MODE = COOL"
-            const matchPeltierMode = line.match(/PELTIER_MODE\s*=\s*(\w+)/);
-            if (matchPeltierMode) {
-              currentData.peltier_mode = matchPeltierMode[1];
-              updated = true;
-            }
-
-            // Match INA226 current sensor line, e.g.:
-            // "INA226_1 Vbus = 12.345 V, Vshunt = 0.01234 V, I = 1.2345 A, P = 15.4321 W"
-            const matchIna = line.match(/INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.\d+)\s*V,\s*Vshunt\s*=\s*(-?\d+\.\d+)\s*V,\s*I\s*=\s*(-?\d+\.\d+)\s*A,\s*P\s*=\s*(-?\d+\.\d+)\s*W/);
-            if (matchIna) {
-              const inaIndex = parseInt(matchIna[1]);
-              const vbus = parseFloat(matchIna[2]);
-              const current = parseFloat(matchIna[4]) * 1000; // A -> mA
-              const power = parseFloat(matchIna[5]);
-              if (inaIndex === 1) {
-                currentData.ina1_v = vbus;
-                currentData.ina1_i = current;
-                currentData.ina1_p = power;
-              } else if (inaIndex === 2) {
-                currentData.ina2_v = vbus;
-                currentData.ina2_i = current;
-                currentData.ina2_p = power;
-              }
-              updated = true;
-            }
-          }
-          
-          // Only push data to chart when we get the last ADC value (mos15)
-          if (updated && currentData.mos15 !== undefined) {
-             const now = Date.now();
-             // Throttle: update UI only every 1 second
-             if (now - lastUpdateTime >= 1000) {
-               lastUpdateTime = now;
-               setDataHistory(prev => {
-                  currentData.time = prev.length > 0 ? prev[prev.length - 1].time + 1 : 1;
-                  const next = [...prev, { ...currentData }];
-                  return next;
-               });
-             }
-             // Reset for next cycle (carry forward values that update at a slower cadence)
-             currentData = {
-               time: 0, temp0: currentData.temp0, temp1: currentData.temp1,
-               hum0: currentData.hum0, hum1: currentData.hum1,
-               ina1_v: currentData.ina1_v, ina1_i: currentData.ina1_i, ina1_p: currentData.ina1_p,
-               ina2_v: currentData.ina2_v, ina2_i: currentData.ina2_i, ina2_p: currentData.ina2_p,
-               setpoint_c: currentData.setpoint_c, peltier_mode: currentData.peltier_mode,
-             };
-          }
+        const match = line.match(/ADC(\d+)\s*=\s*(-?\d+)/);
+        if (match) {
+          const adcIndex = parseInt(match[1]);
+          const adcValue = parseInt(match[2]);
+          currentData[`mos${adcIndex}`] = adcValue * (4.096 / 32768.0) * 1000;
+          updated = true;
         }
-      } catch (error) {
-        // Expected when abort is called
-      } finally {
-        reader.releaseLock();
-      }
+
+        const matchTemp = line.match(/SHT30 Temp\s*=\s*(-?\d+\.\d+)/);
+        if (matchTemp) {
+          currentData.temp0 = parseFloat(matchTemp[1]);
+          updated = true;
+        }
+
+        const matchHumi = line.match(/SHT30 Humi\s*=\s*(\d+\.\d+)/);
+        if (matchHumi) {
+          currentData.hum0 = parseFloat(matchHumi[1]);
+          updated = true;
+        }
+
+        const matchTemp31 = line.match(/SHT31 Temp\s*=\s*(-?\d+\.\d+)/);
+        if (matchTemp31) {
+          currentData.temp1 = parseFloat(matchTemp31[1]);
+          updated = true;
+        }
+
+        const matchHumi31 = line.match(/SHT31 Humi\s*=\s*(\d+\.\d+)/);
+        if (matchHumi31) {
+          currentData.hum1 = parseFloat(matchHumi31[1]);
+          updated = true;
+        }
+
+        const matchSetpoint = line.match(/^(?:ACK )?SETPOINT\s*=\s*(-?\d+\.\d+)/);
+        if (matchSetpoint) {
+          currentData.setpoint_c = parseFloat(matchSetpoint[1]);
+          updated = true;
+        }
+
+        const matchPeltierMode = line.match(/PELTIER_MODE\s*=\s*(\w+)/);
+        if (matchPeltierMode) {
+          currentData.peltier_mode = matchPeltierMode[1];
+          updated = true;
+        }
+
+        const matchIna = line.match(/INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.?\d*)\s*V,\s*I\s*=\s*(-?\d+\.?\d*)\s*mA/);
+        if (matchIna) {
+          const inaIndex = parseInt(matchIna[1]);
+          const vbus = parseFloat(matchIna[2]);
+          const current = parseFloat(matchIna[3]); // sudah dalam mA dari firmware
+          if (inaIndex === 1) {
+            currentData.ina1_v = vbus;
+            currentData.ina1_i = current;
+          } else if (inaIndex === 2) {
+            currentData.ina2_v = vbus;
+            currentData.ina2_i = current;
+          }
+          updated = true;
+        }
+        
+        if (updated && currentData.mos15 !== undefined) {
+           const now = Date.now();
+           if (now - lastUpdateTime >= 1000) {
+             lastUpdateTime = now;
+             setDataHistory(prev => {
+                currentData.time = prev.length > 0 ? prev[prev.length - 1].time + 1 : 1;
+                return [...prev, { ...currentData }];
+             });
+           }
+           // Carry every field forward (including mos0..mos15) so a sensor
+           // that doesn't get a fresh reading this cycle keeps its last
+           // known value instead of going undefined and breaking the line.
+           currentData = { ...currentData, time: 0 };
+        }
+      };
+
+      ws.onclose = () => {
+        setIsConnected(false);
+        setSerialPort(null);
+        serialPortRef.current = null;
+      };
       
-      await pipeDone;
+      ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+        alert("Failed to connect to backend server on port 8080. Make sure the python script is running.");
+      };
+
     } catch (e) {
       console.error(e);
     }
   };
 
-  const disconnectSerial = async () => {
+  const disconnectSerial = () => {
     try {
-      // Abort the pipe first - this cleanly releases the readable stream
-      if (abortController) {
-        abortController.abort();
-        setAbortController(null);
-      }
-      // Small delay to let the pipe fully release
-      await new Promise(r => setTimeout(r, 100));
-      if (serialPort) {
-        try { await serialPort.close(); } catch (e) { /* already closed */ }
-        setSerialPort(null);
+      if (serialPort && serialPort.readyState === WebSocket.OPEN) {
+        serialPort.close();
       }
     } catch (e) {
       console.error(e);
     } finally {
       setIsConnected(false);
+      setSerialPort(null);
+      serialPortRef.current = null;
     }
   };
 
+  // --- Helper: send a serial command ---
+  const sendCommand = useCallback((cmd) => {
+    const ws = serialPortRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(`${cmd}\n`);
+      } catch (e) {
+        console.error('sendCommand error:', e);
+      }
+    }
+  }, []);
+
   // --- Send temperature setpoint to the Teensy (Peltier bang-bang controller) ---
-  const sendSetpoint = useCallback(async () => {
-    if (!serialPort || !serialPort.writable) {
-      alert('Please connect to a serial port first.');
+  const sendSetpoint = useCallback(() => {
+    if (!serialPort || serialPort.readyState !== WebSocket.OPEN) {
+      alert('Please connect to the backend (Start Stream) first.');
       return;
     }
     const value = parseFloat(setpointInput);
@@ -272,13 +262,10 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       return;
     }
 
-    const writer = serialPort.writable.getWriter();
     try {
-      await writer.write(new TextEncoder().encode(`SETPOINT=${value.toFixed(2)}\n`));
+      serialPort.send(`SETPOINT=${value.toFixed(2)}\n`);
     } catch (e) {
       console.error(e);
-    } finally {
-      writer.releaseLock();
     }
   }, [serialPort, setpointInput]);
 
@@ -302,8 +289,58 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     return () => clearInterval(interval);
   }, [isRecording, recordingStartTime]);
 
-  // --- Start / Stop System ---
-  const handleStartSystem = useCallback(() => {
+  // ===== SYSTEM PHASE EXECUTION ENGINE =====
+  const startNextPhase = useCallback(() => {
+    const queue = phaseQueueRef.current;
+    if (queue.length === 0) {
+      // All phases done — send OFF to teensy, stop recording, show save popup
+      sendCommand('PHASE=OFF');
+      setCurrentPhase('');
+      setPhaseTimeLeft(0);
+      setSystemRunning(false);
+      // Stop recording
+      setIsRecording(false);
+      recordingRef.current = false;
+      setRecordingStartTime(null);
+      // Show save popup
+      setShowSavePopup(true);
+      return;
+    }
+
+    const next = queue.shift();
+    setCurrentPhase(next.phase);
+    phaseDurationRef.current = next.durationSec;
+    phaseStartTimeRef.current = Date.now();
+    setPhaseTimeLeft(next.durationSec);
+
+    // Send phase command to teensy
+    sendCommand(`PHASE=${next.phase}`);
+    // Also send PWM for inject phase
+    if (next.phase === 'INJECT') {
+      sendCommand(`PWM=${pump1Pwm}`);
+    }
+  }, [sendCommand, pump1Pwm]);
+
+  // Phase countdown timer
+  useEffect(() => {
+    if (!systemRunning || !currentPhase) return;
+
+    const interval = setInterval(() => {
+      const elapsed = (Date.now() - phaseStartTimeRef.current) / 1000;
+      const remaining = Math.max(0, phaseDurationRef.current - elapsed);
+      setPhaseTimeLeft(Math.ceil(remaining));
+
+      if (remaining <= 0) {
+        clearInterval(interval);
+        startNextPhase();
+      }
+    }, 500);
+
+    return () => clearInterval(interval);
+  }, [systemRunning, currentPhase, startNextPhase]);
+
+  // --- Handle "Start System" button click → show popup ---
+  const handleStartSystemClick = useCallback(() => {
     if (!isConnected) {
       alert('Please connect to a serial port first before starting a session.');
       return;
@@ -313,21 +350,68 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       return;
     }
 
-    if (!isRecording) {
-      // START recording
-      setSessionData([]);
-      dataSnapshotIndexRef.current = dataHistory.length; // start from current position
-      setRecordingStartTime(Date.now());
-      setRecordingElapsed(0);
-      setIsRecording(true);
-      recordingRef.current = true;
-    } else {
-      // STOP recording
+    if (systemRunning) {
+      // STOP the running system
+      if (systemTimerRef.current) clearInterval(systemTimerRef.current);
+      phaseQueueRef.current = [];
+      sendCommand('PHASE=OFF');
+      setCurrentPhase('');
+      setPhaseTimeLeft(0);
+      setSystemRunning(false);
+      // Stop recording
       setIsRecording(false);
       recordingRef.current = false;
       setRecordingStartTime(null);
+      // Show save popup if we have data
+      if (recordingRef.current === false) {
+        // Use a timeout to allow sessionData state to settle
+        setTimeout(() => setShowSavePopup(true), 100);
+      }
+      return;
     }
-  }, [isConnected, isRecording, sessionName, dataHistory.length]);
+
+    // Show the settings popup
+    setShowSystemPopup(true);
+  }, [isConnected, sessionName, systemRunning, sendCommand]);
+
+  // --- Actually start the system (called from popup "Start" button) ---
+  const handleConfirmStart = useCallback(() => {
+    setShowSystemPopup(false);
+
+    // Build phase queue
+    const queue = [];
+    if (idleDuration > 0) {
+      queue.push({ phase: 'IDLE', durationSec: idleDuration * 60 });
+    }
+    if (injectDuration > 0) {
+      queue.push({ phase: 'INJECT', durationSec: injectDuration * 60 });
+    }
+    if (purgeDuration > 0) {
+      queue.push({ phase: 'PURGE', durationSec: purgeDuration * 60 });
+    }
+
+    if (queue.length === 0) {
+      alert('All phase durations are 0. Please set at least one phase duration.');
+      return;
+    }
+
+    phaseQueueRef.current = queue;
+
+    // Send PWM setting to Teensy
+    sendCommand(`PWM=${pump1Pwm}`);
+
+    // Start recording
+    setSessionData([]);
+    dataSnapshotIndexRef.current = dataHistory.length;
+    setRecordingStartTime(Date.now());
+    setRecordingElapsed(0);
+    setIsRecording(true);
+    recordingRef.current = true;
+
+    // Start system
+    setSystemRunning(true);
+    startNextPhase();
+  }, [idleDuration, injectDuration, purgeDuration, pump1Pwm, sendCommand, dataHistory.length, startNextPhase]);
 
   // --- Save Data as CSV ---
   const handleSaveData = useCallback(() => {
@@ -385,36 +469,36 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     return `${m}:${s}`;
   };
 
+  // --- Format phase time left ---
+  const formatPhaseTime = (secs) => {
+    const m = Math.floor(secs / 60);
+    const s = secs % 60;
+    return `${m}:${s.toString().padStart(2, '0')}`;
+  };
+
   const latestData = dataHistory.length > 0 ? dataHistory[dataHistory.length - 1] : null;
+
+  // Compute total system duration for display
+  const totalSystemDuration = (idleDuration + injectDuration + purgeDuration) * 60;
 
   return (
     <div className="page-container">
       <div className="acq-header">
         <h2 className="page-title">Data Acquisition</h2>
         <div className="top-controls-row">
-          <select 
-            className="select-input" 
-            style={{ width: '250px' }}
-            value={selectedPort}
-            onChange={(e) => setSelectedPort(e.target.value)}
-            disabled={isConnected}
-          >
-            {ports.map(p => (
-              <option key={p.name} value={p.name}>
-                {p.name} {p.is_teensy ? '(Teensy)' : ''}
-              </option>
-            ))}
-          </select>
-          
           {!isConnected ? (
             <button className="btn btn-primary" onClick={connectSerial}>
-              Connect
+              Start Stream
             </button>
           ) : (
             <button className="btn btn-danger" onClick={disconnectSerial}>
-              Disconnect
+              Stop Stream
             </button>
           )}
+
+          <button className="btn btn-secondary" onClick={() => setDataHistory([])}>
+            Reset Data
+          </button>
 
           <div className="divider-vert"></div>
 
@@ -425,14 +509,14 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             style={{ width: '200px', borderColor: isRecording ? 'var(--accent-orange)' : undefined }} 
             value={sessionName}
             onChange={(e) => setSessionName(e.target.value)}
-            disabled={isRecording}
+            disabled={isRecording || systemRunning}
           />
           <select 
             className="select-input" 
             style={{ width: '150px' }}
             value={faultLabel}
             onChange={(e) => setFaultLabel(e.target.value)}
-            disabled={isRecording}
+            disabled={isRecording || systemRunning}
           >
             <option value="Baseline">Baseline</option>
             <option value="Normal">Normal</option>
@@ -440,32 +524,34 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             <option value="Arcing">Arcing</option>
           </select>
 
-          {!isRecording ? (
-            <button className="btn btn-primary" onClick={handleStartSystem} title="Start recording session">
+          {!systemRunning ? (
+            <button className="btn btn-primary" onClick={handleStartSystemClick} title="Start system with phase settings">
               <Play size={16} /> Start System
             </button>
           ) : (
-            <button className="btn btn-danger" onClick={handleStartSystem} title="Stop recording session">
-              <Square size={16} /> Stop ({formatElapsed(recordingElapsed)}) — {sessionData.length} pts
+            <button className="btn btn-danger" onClick={handleStartSystemClick} title="Stop running system">
+              <Square size={16} /> Stop System ({formatElapsed(recordingElapsed)})
             </button>
           )}
-          <button 
-            className="btn btn-primary" 
-            onClick={handleSaveData} 
-            disabled={sessionData.length === 0}
-            title={sessionData.length === 0 ? 'No data recorded yet' : `Save ${sessionData.length} data points as CSV`}
-            style={{ opacity: sessionData.length === 0 ? 0.5 : 1 }}
-          >
-            <Save size={16} /> Save Data{sessionData.length > 0 ? ` (${sessionData.length})` : ''}
-          </button>
-          <button className="btn btn-secondary" onClick={() => setIsActuatorModalOpen(true)}>
-            <Settings size={16} /> Actuator Control
-          </button>
-          
-          <div className="divider-vert"></div>
 
-          <select 
-            className="select-input" 
+          {/* Phase indicator during system run */}
+          {systemRunning && currentPhase && (
+            <span style={{
+              padding: '4px 12px',
+              borderRadius: '6px',
+              fontSize: '13px',
+              fontWeight: '700',
+              letterSpacing: '0.5px',
+              backgroundColor: currentPhase === 'IDLE' ? '#3B82F6' : currentPhase === 'INJECT' ? '#F59E0B' : '#10B981',
+              color: '#fff',
+              animation: 'pulse 2s infinite',
+            }}>
+              {currentPhase} — {formatPhaseTime(phaseTimeLeft)}
+            </span>
+          )}
+
+          <select
+            className="select-input"
             style={{ width: '160px', backgroundColor: 'var(--bg-secondary)', color: 'var(--accent-orange)' }}
             value={viewMode}
             onChange={(e) => setViewMode(e.target.value)}
@@ -473,6 +559,43 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             <option value="grid">Grid View</option>
             <option value="combined">Combined Trend</option>
           </select>
+
+          <div className="divider-vert"></div>
+
+          {/* Peltier Control (Chamber) */}
+          <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: '2px', lineHeight: 1.3 }}>
+            <span style={{ fontSize: '11px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+              Setpoint: <strong style={{ color: 'var(--accent-blue)' }}>
+                {latestData && latestData.setpoint_c !== undefined ? latestData.setpoint_c.toFixed(2) : '--.--'} °C
+              </strong>
+            </span>
+            <span style={{ fontSize: '11px', color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
+              Mode: <strong style={{
+                color: latestData && latestData.peltier_mode === 'COOL' ? 'var(--accent-blue)'
+                  : latestData && latestData.peltier_mode === 'HEAT' ? 'var(--status-error)'
+                  : 'var(--text-muted)'
+              }}>
+                {latestData && latestData.peltier_mode ? latestData.peltier_mode : '--'}
+              </strong>
+            </span>
+          </div>
+          <input
+            type="number"
+            step="0.1"
+            className="select-input"
+            style={{ width: '90px' }}
+            value={setpointInput}
+            onChange={(e) => setSetpointInput(e.target.value)}
+            placeholder="°C"
+          />
+          <button
+            className="btn btn-primary"
+            onClick={sendSetpoint}
+            disabled={!isConnected}
+            title={!isConnected ? 'Connect to serial first' : 'Send setpoint to Teensy'}
+          >
+            Set
+          </button>
         </div>
       </div>
 
@@ -480,11 +603,11 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         <div className="charts-grid-4x5">
           {/* Render 16 Gas Sensors */}
           {GAS_SENSORS.map((name, i) => (
-            <MiniChart 
+            <MiniChart
               key={`mos${i}`}
               title={name}
               dataKey={`mos${i}`}
-              color="var(--accent-orange)"
+              color={GAS_COLORS[i % GAS_COLORS.length]}
               domain={['auto', 'auto']} // Dynamic Y-Axis, auto-scale to baseline & max
               unit="mV"
               dataHistory={dataHistory}
@@ -590,15 +713,16 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                     />
                     <Legend wrapperStyle={{ paddingTop: '20px' }} />
                     {GAS_SENSORS.map((name, i) => (
-                      <Line 
+                      <Line
                         key={name}
-                        type="monotone" 
-                        dataKey={`mos${i}`} 
+                        type="monotone"
+                        dataKey={`mos${i}`}
                         name={name}
-                        stroke={GAS_COLORS[i % GAS_COLORS.length]} 
-                        strokeWidth={2} 
-                        dot={false} 
-                        isAnimationActive={false} 
+                        stroke={GAS_COLORS[i % GAS_COLORS.length]}
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                        connectNulls={true}
                       />
                     ))}
                   </LineChart>
@@ -629,48 +753,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                   <span style={{ color: 'var(--status-normal)', fontWeight: 'bold' }}>
                     {latestData && latestData.hum0 !== undefined ? latestData.hum0.toFixed(2) : '--.--'} %
                   </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="mini-chart-card" style={{ flex: 1 }}>
-              <div className="chart-header">
-                <span className="chart-title">Peltier Control (Chamber)</span>
-              </div>
-              <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>SETPOINT:</span>
-                  <span style={{ color: 'var(--accent-blue)', fontWeight: 'bold' }}>
-                    {latestData && latestData.setpoint_c !== undefined ? latestData.setpoint_c.toFixed(2) : '--.--'} °C
-                  </span>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>MODE:</span>
-                  <span style={{
-                    color: latestData && latestData.peltier_mode === 'COOL' ? 'var(--accent-blue)' : 'var(--text-muted)',
-                    fontWeight: 'bold'
-                  }}>
-                    {latestData && latestData.peltier_mode ? latestData.peltier_mode : '--'}
-                  </span>
-                </div>
-                <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
-                  <input
-                    type="number"
-                    step="0.1"
-                    className="select-input"
-                    style={{ flex: 1 }}
-                    value={setpointInput}
-                    onChange={(e) => setSetpointInput(e.target.value)}
-                    placeholder="Setpoint °C"
-                  />
-                  <button
-                    className="btn btn-primary"
-                    onClick={sendSetpoint}
-                    disabled={!isConnected}
-                    title={!isConnected ? 'Connect to serial first' : 'Send setpoint to Teensy'}
-                  >
-                    Set
-                  </button>
                 </div>
               </div>
             </div>
@@ -722,98 +804,164 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         </div>
       )}
 
-      {/* Actuator Modal */}
-      {isActuatorModalOpen && (
+      {/* ===== SYSTEM SETTINGS POPUP ===== */}
+      {showSystemPopup && (
         <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '24px', borderRadius: '12px', width: '500px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
-              <h3 style={{ margin: 0, color: '#0f172a' }}>Actuator Control</h3>
-              <button onClick={() => setIsActuatorModalOpen(false)} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: '20px' }}>✕</button>
-            </div>
-            
-            <div style={{ display: 'flex', gap: '12px', marginBottom: '20px' }}>
-              <button 
-                className={`btn ${actuatorMode === 'auto' ? 'btn-primary' : 'btn-outline'}`}
-                style={{ flex: 1 }}
-                onClick={() => setActuatorMode('auto')}
-              >
-                Automatic Mode
-              </button>
-              <button 
-                className={`btn ${actuatorMode === 'manual' ? 'btn-primary' : 'btn-outline'}`}
-                style={{ flex: 1 }}
-                onClick={() => setActuatorMode('manual')}
-              >
-                Manual Mode
-              </button>
+          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '560px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
+              <h3 style={{ margin: 0, color: '#0f172a', fontSize: '20px' }}>⚙️ System Phase Settings</h3>
+              <button onClick={() => setShowSystemPopup(false)} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: '20px' }}>✕</button>
             </div>
 
-            {actuatorMode === 'auto' && (
-              <div style={{ backgroundColor: '#f8fafc', padding: '16px', borderRadius: '8px', border: '1px solid #e2e8f0' }}>
-                <h4 style={{ marginTop: 0, marginBottom: '12px', color: '#0f172a' }}>Automatic Sequence</h4>
-                <ul style={{ color: '#475569', fontSize: '14px', paddingLeft: '20px', marginBottom: '16px', lineHeight: '1.6' }}>
-                  <li><strong>Idle (2 mins):</strong> Fresh Air Pump ON. All Valves OPEN (except Gas Inlet Valve CLOSED).</li>
-                  <li><strong>Injecting (5 mins):</strong> Gas Inlet Pump ON. Gas Inlet Valve OPEN. Fresh Air & Outlet Valves CLOSED.</li>
-                  <li><strong>Purging (4 mins):</strong> Gas Outlet Pump ON. Gas Outlet Valve OPEN. Others OFF/CLOSED.</li>
-                </ul>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            {/* Phase Durations */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+              
+              {/* IDLE Phase */}
+              <div style={{ backgroundColor: '#ffffff', padding: '16px', borderRadius: '8px', border: '1px solid #BFDBFE' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
                   <div>
-                    <span style={{ display: 'block', fontSize: '12px', color: '#64748b' }}>Current Phase:</span>
-                    <strong style={{ color: autoPhase === 'stopped' ? '#94a3b8' : '#FDBB16' }}>
-                      {autoPhase.toUpperCase()}
-                    </strong>
+                    <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '15px' }}>IDLE Phase</span>
                   </div>
-                  <button 
-                    className={`btn ${autoPhase === 'stopped' ? 'btn-primary' : 'btn-danger'}`}
-                    onClick={() => setAutoPhase(autoPhase === 'stopped' ? 'idle' : 'stopped')}
-                  >
-                    {autoPhase === 'stopped' ? 'Start Sequence' : 'Stop Sequence'}
-                  </button>
+                  <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '18px', minWidth: '60px', textAlign: 'right' }}>{idleDuration} min</span>
+                </div>
+                <input
+                  type="range"
+                  min="0" max="5" step="0.5"
+                  value={idleDuration}
+                  onChange={(e) => setIdleDuration(parseFloat(e.target.value))}
+                  style={{ width: '100%', accentColor: '#3B82F6' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9CA3AF' }}>
+                  <span>0 min</span><span>5 min</span>
                 </div>
               </div>
-            )}
 
-            {actuatorMode === 'manual' && (
-              <div style={{ backgroundColor: '#f8fafc', padding: '16px', borderRadius: '8px', border: '1px solid #e2e8f0', display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ color: '#0f172a', fontWeight: '500' }}>Fresh Air (Pump & Valve)</span>
-                  <button 
-                    className={`btn ${manualFreshAir ? 'btn-primary' : 'btn-outline'}`}
-                    onClick={() => setManualFreshAir(!manualFreshAir)}
-                    style={{ minWidth: '80px', color: manualFreshAir ? '#fff' : '#0f172a', borderColor: manualFreshAir ? 'transparent' : '#cbd5e1' }}
-                  >
-                    {manualFreshAir ? 'ON' : 'OFF'}
-                  </button>
+              {/* INJECT Phase */}
+              <div style={{ backgroundColor: '#ffffff', padding: '16px', borderRadius: '8px', border: '1px solid #BFDBFE' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <div>
+                    <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '15px' }}>INJECTING Phase</span>
+                  </div>
+                  <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '18px', minWidth: '60px', textAlign: 'right' }}>{injectDuration} min</span>
                 </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ color: '#0f172a', fontWeight: '500' }}>Gas Inlet (Pump & Valve)</span>
-                  <button 
-                    className={`btn ${manualGasInlet ? 'btn-primary' : 'btn-outline'}`}
-                    onClick={() => setManualGasInlet(!manualGasInlet)}
-                    style={{ minWidth: '80px', color: manualGasInlet ? '#fff' : '#0f172a', borderColor: manualGasInlet ? 'transparent' : '#cbd5e1' }}
-                  >
-                    {manualGasInlet ? 'ON' : 'OFF'}
-                  </button>
-                </div>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <span style={{ color: '#0f172a', fontWeight: '500' }}>Gas Outlet (Pump & Valve)</span>
-                  <button 
-                    className={`btn ${manualGasOutlet ? 'btn-primary' : 'btn-outline'}`}
-                    onClick={() => setManualGasOutlet(!manualGasOutlet)}
-                    style={{ minWidth: '80px', color: manualGasOutlet ? '#fff' : '#0f172a', borderColor: manualGasOutlet ? 'transparent' : '#cbd5e1' }}
-                  >
-                    {manualGasOutlet ? 'ON' : 'OFF'}
-                  </button>
+                <input
+                  type="range"
+                  min="0" max="5" step="0.5"
+                  value={injectDuration}
+                  onChange={(e) => setInjectDuration(parseFloat(e.target.value))}
+                  style={{ width: '100%', accentColor: '#3B82F6' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9CA3AF' }}>
+                  <span>0 min</span><span>5 min</span>
                 </div>
               </div>
-            )}
-            
-            <div style={{ marginTop: '20px', fontSize: '12px', color: '#64748b', textAlign: 'center' }}>
-              Commands will be sent directly to the embedded Teensy module.
+
+              {/* PURGE Phase */}
+              <div style={{ backgroundColor: '#ffffff', padding: '16px', borderRadius: '8px', border: '1px solid #BFDBFE' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <div>
+                    <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '15px' }}>PURGING Phase</span>
+                  </div>
+                  <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '18px', minWidth: '60px', textAlign: 'right' }}>{purgeDuration} min</span>
+                </div>
+                <input
+                  type="range"
+                  min="0" max="5" step="0.5"
+                  value={purgeDuration}
+                  onChange={(e) => setPurgeDuration(parseFloat(e.target.value))}
+                  style={{ width: '100%', accentColor: '#3B82F6' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9CA3AF' }}>
+                  <span>0 min</span><span>5 min</span>
+                </div>
+              </div>
+
+              {/* PUMP1 PWM Slider */}
+              <div style={{ backgroundColor: '#ffffff', padding: '16px', borderRadius: '8px', border: '1px solid #BFDBFE' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <div>
+                    <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '15px' }}>Pump 1 PWM (Inject Phase)</span>
+                    <div style={{ fontSize: '12px', color: '#6B7280', marginTop: '2px' }}>BTS7960 pump speed during the Injecting phase</div>
+                  </div>
+                  <span style={{ fontWeight: '700', color: '#1E40AF', fontSize: '18px', minWidth: '60px', textAlign: 'right' }}>{pump1Pwm}%</span>
+                </div>
+                <input
+                  type="range"
+                  min="0" max="100" step="5"
+                  value={pump1Pwm}
+                  onChange={(e) => setPump1Pwm(parseInt(e.target.value))}
+                  style={{ width: '100%', accentColor: '#3B82F6' }}
+                />
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '11px', color: '#9CA3AF' }}>
+                  <span>0%</span><span>50%</span><span>100%</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Summary + Buttons */}
+            <div style={{ marginTop: '20px', padding: '12px 16px', backgroundColor: '#EFF6FF', borderRadius: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <div style={{ fontSize: '13px', color: '#475569' }}>
+                Total Duration: <strong>{(idleDuration + injectDuration + purgeDuration).toFixed(1)} min</strong>
+                {' '}({formatElapsed(Math.round((idleDuration + injectDuration + purgeDuration) * 60))})
+              </div>
+              <div style={{ display: 'flex', gap: '10px' }}>
+                <button 
+                  className="btn btn-outline"
+                  onClick={() => setShowSystemPopup(false)}
+                  style={{ color: '#64748b', borderColor: '#CBD5E1' }}
+                >
+                  Cancel
+                </button>
+                <button 
+                  className="btn btn-primary"
+                  onClick={handleConfirmStart}
+                  style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+                >
+                  <Play size={16} /> Start System
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
+
+      {/* ===== SAVE DATA POPUP (after system completes) ===== */}
+      {showSavePopup && (
+        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '460px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)', textAlign: 'center' }}>
+            <div style={{ fontSize: '48px', marginBottom: '12px' }}>✅</div>
+            <h3 style={{ margin: '0 0 8px 0', color: '#0f172a', fontSize: '20px' }}>System Phases Completed!</h3>
+            <p style={{ color: '#475569', marginBottom: '6px' }}>
+              All phases (Idle → Injecting → Purging) have finished.
+            </p>
+            <p style={{ color: '#64748b', fontSize: '14px', marginBottom: '20px' }}>
+              <strong>{sessionData.length}</strong> data points recorded during session "<strong>{sessionName}</strong>".
+            </p>
+
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
+              <button
+                className="btn btn-outline"
+                onClick={() => setShowSavePopup(false)}
+                style={{ color: '#64748b', borderColor: '#CBD5E1' }}
+              >
+                Close
+              </button>
+              <button
+                className="btn btn-primary"
+                onClick={() => {
+                  handleSaveData();
+                  setShowSavePopup(false);
+                }}
+                style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
+              >
+                <Save size={16} /> Save as CSV
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+
 
     </div>
   );

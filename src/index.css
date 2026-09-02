@@ -288,12 +288,12 @@ button {
 }
 
 .btn-danger {
-  background-color: #fee2e2;
-  color: var(--status-error);
+  background-color: var(--status-error);
+  color: #ffffff;
 }
 
 .btn-danger:hover {
-  background-color: #fca5a5;
+  background-color: #dc2626;
 }
 
 .btn-outline {

@@ -17,6 +17,7 @@ pub struct TeensySerial {
     is_running: Arc<AtomicBool>,
     latest_reading: Arc<Mutex<Option<SensorReading>>>,
     readings_buffer: Arc<Mutex<Vec<SensorReading>>>,
+    tx_cmd: Arc<Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>>,
 }
 
 impl TeensySerial {
@@ -27,6 +28,7 @@ impl TeensySerial {
             is_running: Arc::new(AtomicBool::new(false)),
             latest_reading: Arc::new(Mutex::new(None)),
             readings_buffer: Arc::new(Mutex::new(Vec::new())),
+            tx_cmd: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -82,6 +84,10 @@ impl TeensySerial {
         *self.port_name.lock() = Some(port_name.to_string());
         self.is_running.store(true, Ordering::Relaxed);
 
+        // Setup command channel
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.tx_cmd.lock() = Some(tx);
+
         // Spawn background reader thread
         let port_name = port_name.to_string();
         let baud = self.baud_rate;
@@ -90,7 +96,7 @@ impl TeensySerial {
         let buffer = Arc::clone(&self.readings_buffer);
 
         std::thread::spawn(move || {
-            if let Err(e) = read_serial_loop(&port_name, baud, &is_running, &latest, &buffer) {
+            if let Err(e) = read_serial_loop(&port_name, baud, &is_running, &latest, &buffer, rx) {
                 error!("Serial reader error: {}", e);
                 is_running.store(false, Ordering::Relaxed);
             }
@@ -117,6 +123,14 @@ impl TeensySerial {
         self.latest_reading.lock().clone()
     }
 
+    /// Write data to serial port
+    pub fn write(&self, data: &[u8]) -> Result<()> {
+        if let Some(tx) = &*self.tx_cmd.lock() {
+            tx.send(data.to_vec()).context("Failed to send command to serial thread")?;
+        }
+        Ok(())
+    }
+
     /// Drain buffered readings (moves them out)
     pub fn drain_buffer(&self) -> Vec<SensorReading> {
         let mut buf = self.readings_buffer.lock();
@@ -136,9 +150,10 @@ fn read_serial_loop(
     is_running: &AtomicBool,
     latest: &Mutex<Option<SensorReading>>,
     buffer: &Mutex<Vec<SensorReading>>,
+    rx_cmd: std::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     let mut port = serialport::new(port_name, baud_rate)
-        .timeout(Duration::from_millis(500))
+        .timeout(Duration::from_millis(100))
         .open()
         .context("Failed to open serial port")?;
 
@@ -146,6 +161,13 @@ fn read_serial_loop(
     let mut byte_buf = [0u8; 1024];
 
     while is_running.load(Ordering::Relaxed) {
+        // Check for pending commands
+        while let Ok(cmd) = rx_cmd.try_recv() {
+            if let Err(e) = port.write_all(&cmd) {
+                warn!("Failed to write to serial: {}", e);
+            }
+        }
+
         match port.read(&mut byte_buf) {
             Ok(n) => {
                 let text = String::from_utf8_lossy(&byte_buf[..n]);
