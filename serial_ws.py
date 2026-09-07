@@ -6,7 +6,10 @@ import usb.util
 import threading
 import time
 
+from persistence import SensorPersistence
+
 dev = None
+persistence = SensorPersistence()
 
 def connect_serial():
     global dev
@@ -64,8 +67,13 @@ def serial_read_loop(loop):
                     while b'\n' in buffer:
                         line, buffer = buffer.split(b'\n', 1)
                         decoded = line.decode('utf-8', errors='ignore').strip()
-                        if decoded and clients:
-                            asyncio.run_coroutine_threadsafe(broadcast_message(decoded), loop)
+                        if decoded:
+                            try:
+                                persistence.process_line(decoded)
+                            except Exception as e:
+                                print(f"Persistence error: {e}")
+                            if clients:
+                                asyncio.run_coroutine_threadsafe(broadcast_message(decoded), loop)
             except usb.core.USBError as e:
                 # Timeout is normal if no data, error code usually 110
                 if e.errno == 110 or 'timeout' in str(e).lower():

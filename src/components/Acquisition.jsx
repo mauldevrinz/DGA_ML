@@ -177,17 +177,22 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           updated = true;
         }
 
-        const matchIna = line.match(/INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.?\d*)\s*V,\s*I\s*=\s*(-?\d+\.?\d*)\s*mA/);
+        // Format aktual dari firmware (lihat usb_println! di src/main.rs):
+        // "INA226_1 Vbus = 11.702 V, Vshunt = 0.02616 V, I = 5.2315 A, P = 61.2375 W"
+        const matchIna = line.match(/INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.?\d*)\s*V,\s*Vshunt\s*=\s*(-?\d+\.?\d*)\s*V,\s*I\s*=\s*(-?\d+\.?\d*)\s*A,\s*P\s*=\s*(-?\d+\.?\d*)\s*W/);
         if (matchIna) {
           const inaIndex = parseInt(matchIna[1]);
           const vbus = parseFloat(matchIna[2]);
-          const current = parseFloat(matchIna[3]); // sudah dalam mA dari firmware
+          const currentMa = parseFloat(matchIna[4]) * 1000; // firmware kirim A, GUI pakai mA
+          const power = parseFloat(matchIna[5]);
           if (inaIndex === 1) {
             currentData.ina1_v = vbus;
-            currentData.ina1_i = current;
+            currentData.ina1_i = currentMa;
+            currentData.ina1_p = power;
           } else if (inaIndex === 2) {
             currentData.ina2_v = vbus;
-            currentData.ina2_i = current;
+            currentData.ina2_i = currentMa;
+            currentData.ina2_p = power;
           }
           updated = true;
         }
@@ -655,9 +660,10 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
 
-          {/* INA226 Current Sensors */}
+          {/* INA226 Current Sensors: #1 mengukur arus & tegangan aktuator,
+              #2 mengukur arus & tegangan suplai sensor + mikrokontroller */}
           <MiniChart
-            title="INA226 #1 CURRENT"
+            title="INA226 #1 CURRENT (ACTUATOR)"
             dataKey="ina1_i"
             color="var(--accent-orange)"
             domain={['auto', 'auto']}
@@ -666,7 +672,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="INA226 #1 VOLTAGE"
+            title="INA226 #1 VOLTAGE (ACTUATOR)"
             dataKey="ina1_v"
             color="var(--accent-blue)"
             domain={['auto', 'auto']}
@@ -675,7 +681,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="INA226 #2 CURRENT"
+            title="INA226 #2 CURRENT (SENSOR+MCU)"
             dataKey="ina2_i"
             color="var(--accent-orange)"
             domain={['auto', 'auto']}
@@ -684,7 +690,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="INA226 #2 VOLTAGE"
+            title="INA226 #2 VOLTAGE (SENSOR+MCU)"
             dataKey="ina2_v"
             color="var(--accent-blue)"
             domain={['auto', 'auto']}
@@ -783,7 +789,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               </div>
               <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>INA226 #1 (I / V):</span>
+                  <span style={{ color: 'var(--text-muted)' }}>INA226 #1 - Actuator (I / V):</span>
                   <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
                     {latestData && latestData.ina1_i !== undefined ? latestData.ina1_i.toFixed(2) : '--.--'} mA
                     {' / '}
@@ -791,7 +797,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>INA226 #2 (I / V):</span>
+                  <span style={{ color: 'var(--text-muted)' }}>INA226 #2 - Sensor + MCU (I / V):</span>
                   <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
                     {latestData && latestData.ina2_i !== undefined ? latestData.ina2_i.toFixed(2) : '--.--'} mA
                     {' / '}

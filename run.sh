@@ -18,6 +18,17 @@ cargo build
 
 echo ""
 echo "====================================="
+echo "📊 Cek InfluxDB service..."
+echo "====================================="
+if curl -sf http://127.0.0.1:8086/health > /dev/null; then
+    echo "InfluxDB OK (127.0.0.1:8086)"
+else
+    echo "⚠️  InfluxDB tidak merespons di 127.0.0.1:8086 — data sensor tetap tersimpan di SQLite,"
+    echo "    tapi tidak akan masuk ke InfluxDB. Cek: sudo systemctl status influxdb"
+fi
+
+echo ""
+echo "====================================="
 echo "🐍 Menjalankan Python WebSocket Server (serial_ws.py)..."
 echo "====================================="
 python3 serial_ws.py &

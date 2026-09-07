@@ -506,10 +506,16 @@ fn main() -> ! {
     // SHT31 (bus i2c1) - pin ADDR di-jumper ke VCC => alamat 0x45
     const SHT31_ADDR: u8 = 0x45;
 
-    // INA226 (sensor arus, bus i2c1) - alamat ditentukan jumper A0/A1 pada modul:
-    //   - INA226 #1: jumper A0 -> VCC, A1 -> GND  => alamat 0x41
-    //   - INA226 #2: jumper A1 -> VCC, A0 -> GND  => alamat 0x44
-    const INA226_ADDR: [u8; 2] = [0x41, 0x44];
+    // INA226 (sensor arus, bus i2c1) - alamat dikonfirmasi lewat I2C scan
+    // (lihat "I2C1 scan" di log), bukan cuma asumsi posisi jumper:
+    //   - INA226 #1: alamat 0x41 (jumper A0 -> VCC, A1 -> GND) - mengukur
+    //     arus & tegangan AKTUATOR, pakai shunt R005, arus ~4-5 A.
+    //   - INA226 #2: alamat 0x40 (non-jumper / default) - mengukur arus &
+    //     tegangan suplai SENSOR + MIKROKONTROLLER (bukan aktuator).
+    //     Sebelumnya kode salah nembak ke 0x44, alamat yang di scan
+    //     ternyata KOSONG (tidak ada device di sana), jadi jalur ini
+    //     tidak pernah terbaca sama sekali sebelum diperbaiki.
+    const INA226_ADDR: [u8; 2] = [0x41, 0x40];
 
     const INA226_REG_CONFIG: u8 = 0x00;
     const INA226_REG_SHUNT: u8 = 0x01;
@@ -518,17 +524,36 @@ fn main() -> ! {
     const INA226_REG_CURRENT: u8 = 0x04;
     const INA226_REG_CALIB: u8 = 0x05;
 
-    // Asumsi shunt resistor 0.1 ohm, arus maksimum ~3.2 A (umum pada modul breakout
-    // INA226 di pasaran). Jika shunt resistor pada modul Anda berbeda, sesuaikan
-    // INA226_CURRENT_LSB dan INA226_CAL_VALUE:
+    // Shunt resistor sudah diganti dari 0.1 ohm (R100) menjadi 0.005 ohm (R005).
+    // Arus terukur di lapangan sekitar 4-5 A, jadi CURRENT_LSB dinaikkan ke
+    // 500 uA/bit (dari semula 100 uA/bit) supaya register current 16-bit
+    // (maks +-32767 count) tidak overflow/clip sebelum sempat merepresentasikan
+    // arus sebenarnya. Kalau shunt/rentang arus diganti lagi, hitung ulang:
     //   CAL = 0.00512 / (CURRENT_LSB * R_SHUNT)
-    const INA226_CURRENT_LSB: f32 = 0.0001; // 100 uA / bit
+    //       = 0.00512 / (0.0005 * 0.005) = 2048
+    // Rentang maksimum sekarang: 32767 * 0.0005 A = ~16.38 A, persis mendekati
+    // batas saturasi tegangan shunt R005 sendiri (+-81.92 mV / 0.005 ohm =
+    // +-16.38 A), jadi keduanya sudah sinkron.
+    const INA226_CURRENT_LSB: f32 = 0.0005; // 500 uA / bit
     const INA226_POWER_LSB: f32 = INA226_CURRENT_LSB * 25.0;
-    const INA226_CAL_VALUE: u16 = 512;
+    const INA226_CAL_VALUE: u16 = 2048;
     const INA226_BUS_LSB: f32 = 0.00125; // 1.25 mV / bit (tetap, sesuai datasheet)
     const INA226_SHUNT_LSB: f32 = 0.0000025; // 2.5 uV / bit (tetap, sesuai datasheet)
 
     let mut ina226_i2c = i2c1_bus.acquire_i2c();
+
+    // Scan sekali di startup untuk memastikan alamat fisik yang benar-benar ACK
+    // di bus i2c1 ini (jangan cuma andalkan asumsi posisi jumper A0/A1).
+    // PENTING: pakai write 1 byte dummy, bukan 0 byte - write kosong pada HAL
+    // i2c ini tidak selalu sempat mendeteksi NACK fase alamat sebelum STOP
+    // dikirim, sehingga hasilnya bisa ACK palsu di hampir semua alamat.
+    usb_println!("I2C1 scan:");
+    for addr in 0x03u8..=0x77u8 {
+        if embedded_hal::blocking::i2c::Write::write(&mut ina226_i2c, addr, &[0x00]).is_ok() {
+            usb_println!("  addr {:#04x}: ACK", addr);
+        }
+    }
+
     let mut ina226_ok = [false; 2];
     for i in 0..2 {
         let addr = INA226_ADDR[i];
@@ -813,6 +838,11 @@ fn main() -> ! {
             // INA226 read (bus i2c1, 2x sensor arus)
             for i in 0..2 {
                 if !ina226_ok[i] {
+                    usb_println!(
+                        "INA226_{} (addr {:#x}): ERROR (kalibrasi/I2C gagal, lewati)",
+                        i + 1,
+                        INA226_ADDR[i]
+                    );
                     continue;
                 }
                 let addr = INA226_ADDR[i];
