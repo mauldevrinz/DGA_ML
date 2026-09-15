@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Activity, BrainCircuit, Zap, Info, Menu } from 'lucide-react';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import Acquisition from './components/Acquisition';
@@ -10,8 +10,21 @@ function App() {
   const [currentPage, setCurrentPage] = useLocalStorage('dga_currentPage', 'acquisition');
   const [isConnected, setIsConnected] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useLocalStorage('dga_isSidebarOpen', true);
+  const [wibTime, setWibTime] = useState('');
 
-
+  useEffect(() => {
+    const formatter = new Intl.DateTimeFormat('en-GB', {
+      timeZone: 'Asia/Jakarta',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    });
+    const tick = () => setWibTime(formatter.format(new Date()));
+    tick();
+    const interval = setInterval(tick, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   return (
     <div className="app-container">
@@ -29,9 +42,14 @@ function App() {
           <span className="app-subtitle">Transformer Fault Diagnosis System</span>
         </div>
         
-        <div className={`status-badge ${isConnected ? 'connected' : 'disconnected'}`}>
-          <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: isConnected ? 'var(--status-normal)' : 'var(--text-muted)' }}></div>
-          {isConnected ? 'Connected' : 'Disconnected'}
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', gridColumn: 3, justifySelf: 'end' }}>
+          <span style={{ color: 'var(--text-muted)', fontSize: '14px', fontVariantNumeric: 'tabular-nums', textAlign: 'right', minWidth: '5.5ch' }}>
+            {wibTime} WIB
+          </span>
+          <div className={`status-badge ${isConnected ? 'connected' : 'disconnected'}`}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: isConnected ? '#16a34a' : 'var(--status-error)' }}></div>
+            {isConnected ? 'Connected' : 'Disconnected'}
+          </div>
         </div>
       </header>
 

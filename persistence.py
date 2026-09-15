@@ -12,11 +12,26 @@ import requests
 
 ROOT = Path(__file__).resolve().parent
 
-MOS_FIELDS = [f"mos{i}" for i in range(16)]
-NUMERIC_FIELDS = MOS_FIELDS + [
-    "temp0", "temp1", "hum0", "hum1",
-    "ina1_v", "ina1_i", "ina1_p",
-    "ina2_v", "ina2_i", "ina2_p",
+# ADCn -> sensor name, index-aligned with the firmware's usb_println! order
+# (TEENSYCODE/teensy-rust/src/main.rs) and the GAS_SENSORS array in
+# src/components/Acquisition.jsx. IR12EM_REF (ADC15) is deliberately last;
+# the firmware prints it last on purpose to trigger the frontend.
+ADC_SENSOR_NAMES = [
+    "tgs2600", "tgs2611", "tgs2610", "tgs822", "tgs813",
+    "mq2", "mq6", "mq8", "mq4", "mq3",
+    "mq135", "mq9", "mq7", "mq5",
+    "ir12em_act", "ir12em_ref",
+]
+# SHT30 measures the chamber air (also used for Peltier bang-bang control,
+# see "KONTROL PELTIER ... suhu chamber (SHT30)" in main.rs); SHT31 measures
+# the oil sample itself.
+# INA226 #1 measures the actuator (pump/peltier) supply; INA226 #2 measures
+# the sensor array + microcontroller supply.
+NUMERIC_FIELDS = ADC_SENSOR_NAMES + [
+    "temp_chamber", "hum_chamber",
+    "temp_sample", "hum_sample",
+    "ina_actuator_v", "ina_actuator_i", "ina_actuator_p",
+    "ina_sensor_mcu_v", "ina_sensor_mcu_i", "ina_sensor_mcu_p",
     "setpoint_c",
 ]
 
@@ -92,25 +107,25 @@ class SensorPersistence:
 
         if m := RE_ADC.search(line):
             idx = int(m.group(1))
-            if 0 <= idx <= 15:
+            if 0 <= idx < len(ADC_SENSOR_NAMES):
                 adc_value = int(m.group(2))
-                sample[f"mos{idx}"] = adc_value * (4.096 / 32768.0) * 1000
+                sample[ADC_SENSOR_NAMES[idx]] = adc_value * (4.096 / 32768.0) * 1000
                 updated = True
 
         if m := RE_TEMP0.search(line):
-            sample["temp0"] = float(m.group(1))
+            sample["temp_chamber"] = float(m.group(1))
             updated = True
 
         if m := RE_HUM0.search(line):
-            sample["hum0"] = float(m.group(1))
+            sample["hum_chamber"] = float(m.group(1))
             updated = True
 
         if m := RE_TEMP1.search(line):
-            sample["temp1"] = float(m.group(1))
+            sample["temp_sample"] = float(m.group(1))
             updated = True
 
         if m := RE_HUM1.search(line):
-            sample["hum1"] = float(m.group(1))
+            sample["hum_sample"] = float(m.group(1))
             updated = True
 
         if m := RE_SETPOINT.match(line):
@@ -127,17 +142,17 @@ class SensorPersistence:
             current_ma = float(m.group(4)) * 1000  # firmware sends A, we store mA
             power = float(m.group(5))
             if ina_index == 1:
-                sample["ina1_v"] = vbus
-                sample["ina1_i"] = current_ma
-                sample["ina1_p"] = power
+                sample["ina_actuator_v"] = vbus
+                sample["ina_actuator_i"] = current_ma
+                sample["ina_actuator_p"] = power
                 updated = True
             elif ina_index == 2:
-                sample["ina2_v"] = vbus
-                sample["ina2_i"] = current_ma
-                sample["ina2_p"] = power
+                sample["ina_sensor_mcu_v"] = vbus
+                sample["ina_sensor_mcu_i"] = current_ma
+                sample["ina_sensor_mcu_p"] = power
                 updated = True
 
-        if not updated or sample["mos15"] is None:
+        if not updated or sample["ir12em_ref"] is None:
             return
 
         now = time.time()

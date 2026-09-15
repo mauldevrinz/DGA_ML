@@ -214,6 +214,216 @@ macro_rules! usb_println {
     }};
 }
 
+// ===================================================
+// NDIR SENSOR — SGX IR12EM inline processing
+// Ported from HydroCarbon-ELKA/hello-world (RTIC) → polling loop.
+// Signal chain: ADS1115 raw → Median5 → EMA → NdirState → ProcessedFilter
+// ===================================================
+
+// -- Tuning constants (adjusted for ADS1115 16-bit, 0..32767 single-ended) --
+const NDIR_RAW_EMA_ALPHA:  f32 = 0.25;    // EMA weight for raw ADC channels
+const NDIR_PROC_EMA_ALPHA: f32 = 0.20;    // EMA weight for ratio/response/absorbance
+const NDIR_REF_DIFF_MIN:   u16 = 500;     // min ref_diff for valid ratio (~1.5% of 32767)
+const NDIR_HALF_PERIOD_MS: u32 = 125;     // 4 Hz lamp, 50% duty → 125 ms half-period
+const NDIR_BASELINE_CYCLES: u32 = 80;     // pairs for baseline (~80 s at 1 pair/s loop)
+
+const MOX_EMA_ALPHA:       f32 = 0.20;    // EMA weight for slow MOX sensors
+
+/// Single-channel EMA: y[n] = α·x[n] + (1-α)·y[n-1]
+#[derive(Clone, Copy)]
+struct NdirEma { alpha: f32, value: f32, initialized: bool }
+
+impl NdirEma {
+    const fn new(alpha: f32) -> Self {
+        Self { alpha, value: 0.0, initialized: false }
+    }
+    fn update(&mut self, x: f32) -> f32 {
+        if !self.initialized {
+            self.value = x;
+            self.initialized = true;
+        } else {
+            self.value = self.alpha * x + (1.0 - self.alpha) * self.value;
+        }
+        self.value
+    }
+    fn update_i16(&mut self, x: i16) -> i16 {
+        self.update(x as f32) as i16
+    }
+    fn as_u16(&self) -> u16 {
+        self.value.max(0.0).min(u16::MAX as f32) as u16
+    }
+}
+
+/// Median-of-5 sliding window denoiser.
+struct NdirMedian5 { buf: [u16; 5], idx: usize, filled: u8 }
+
+impl NdirMedian5 {
+    const fn new() -> Self {
+        Self { buf: [0; 5], idx: 0, filled: 0 }
+    }
+    fn update(&mut self, x: u16) -> u16 {
+        self.buf[self.idx] = x;
+        self.idx = (self.idx + 1) % 5;
+        if self.filled < 5 { self.filled += 1; }
+        let n = self.filled as usize;
+        let mut s = [0u16; 5];
+        s[..n].copy_from_slice(&self.buf[..n]);
+        // Insertion sort on ≤5 elements — trivially fast.
+        for i in 1..n {
+            let key = s[i];
+            let mut j = i;
+            while j > 0 && s[j - 1] > key { s[j] = s[j - 1]; j -= 1; }
+            s[j] = key;
+        }
+        s[n / 2]
+    }
+}
+
+/// Combined per-channel filter: Median5 → EMA.
+struct NdirChannelFilter { median: NdirMedian5, ema: NdirEma }
+
+impl NdirChannelFilter {
+    const fn new(alpha: f32) -> Self {
+        Self { median: NdirMedian5::new(), ema: NdirEma::new(alpha) }
+    }
+    /// Push raw ADC count. Returns (median_u16, ema_f32).
+    fn update(&mut self, raw: u16) -> (u16, f32) {
+        let med = self.median.update(raw);
+        let ema = self.ema.update(med as f32);
+        (med, ema)
+    }
+    /// EMA output rounded to u16.
+    fn filt_u16(&self) -> u16 { self.ema.as_u16() }
+}
+
+/// ON half-cycle raw sample.
+#[derive(Clone, Copy, Default)]
+struct NdirHalfSample { act: u16, reference: u16 }
+
+/// Values produced after one complete ON/OFF lamp pair.
+#[derive(Clone, Copy, Default)]
+struct NdirProcessedSample {
+    _act_diff:       u16,
+    _ref_diff:       u16,
+    ratio:          f32,
+    baseline_ratio: f32,
+    response_pct:   f32,
+    baseline_ready: bool,
+}
+
+/// NDIR state machine — pure math, no HAL.
+struct NdirState {
+    on_sample:       Option<NdirHalfSample>,
+    baseline_sum:    f32,
+    baseline_count:  u32,
+    baseline_target: u32,
+    baseline_ratio:  f32,
+    baseline_ready:  bool,
+}
+
+impl NdirState {
+    const fn new(baseline_target: u32) -> Self {
+        Self {
+            on_sample: None, baseline_sum: 0.0, baseline_count: 0,
+            baseline_target, baseline_ratio: 1.0, baseline_ready: false,
+        }
+    }
+
+    /// Store ON-phase sample (filtered u16 values).
+    fn capture_on(&mut self, act: u16, reference: u16) {
+        self.on_sample = Some(NdirHalfSample { act, reference });
+    }
+
+    /// Store OFF-phase sample, compute and return the processed pair.
+    /// Returns None if no ON sample captured or ref_diff < NDIR_REF_DIFF_MIN.
+    fn capture_off_and_process(
+        &mut self, act_off: u16, ref_off: u16,
+    ) -> Option<NdirProcessedSample> {
+        let on = self.on_sample.take()?;
+        let act_diff = on.act.abs_diff(act_off);
+        let ref_diff = on.reference.abs_diff(ref_off);
+
+        if ref_diff < NDIR_REF_DIFF_MIN { return None; }
+
+        let ratio = act_diff as f32 / ref_diff as f32;
+
+        if !self.baseline_ready {
+            self.baseline_sum   += ratio;
+            self.baseline_count += 1;
+            if self.baseline_count >= self.baseline_target {
+                self.baseline_ratio = self.baseline_sum / self.baseline_count as f32;
+                self.baseline_ready = true;
+            }
+            return Some(NdirProcessedSample {
+                _act_diff: act_diff, _ref_diff: ref_diff, ratio,
+                baseline_ratio: self.baseline_ratio,
+                response_pct: 0.0, baseline_ready: self.baseline_ready,
+            });
+        }
+
+        let response_pct =
+            ((ratio - self.baseline_ratio) / self.baseline_ratio) * 100.0;
+        Some(NdirProcessedSample {
+            _act_diff: act_diff, _ref_diff: ref_diff, ratio,
+            baseline_ratio: self.baseline_ratio,
+            response_pct, baseline_ready: true,
+        })
+    }
+}
+
+/// EMA filters for processed outputs (ratio, response_pct, absorbance).
+struct NdirProcessedFilter {
+    ratio_ema:      NdirEma,
+    response_ema:   NdirEma,
+    absorbance_ema: NdirEma,
+}
+
+/// Output of NdirProcessedFilter::update.
+#[derive(Clone, Copy)]
+struct NdirFilteredProcessed {
+    ratio_filt:    f32,
+    response_filt: f32,
+    abs_raw:       f32,
+    abs_filt:      f32,
+}
+
+impl NdirProcessedFilter {
+    const fn new(alpha: f32) -> Self {
+        Self {
+            ratio_ema:      NdirEma::new(alpha),
+            response_ema:   NdirEma::new(alpha),
+            absorbance_ema: NdirEma::new(alpha),
+        }
+    }
+    fn update(
+        &mut self, ratio: f32, response_pct: f32, baseline_ratio: f32,
+    ) -> NdirFilteredProcessed {
+        let ratio_filt    = self.ratio_ema.update(ratio);
+        let response_filt = self.response_ema.update(response_pct);
+        let abs_raw       = ndir_absorbance(ratio, baseline_ratio);
+        let abs_filt      = self.absorbance_ema.update(abs_raw);
+        NdirFilteredProcessed { ratio_filt, response_filt, abs_raw, abs_filt }
+    }
+}
+
+/// Beer-Lambert absorbance: A = −ln(ratio / baseline_ratio)
+fn ndir_absorbance(ratio: f32, baseline_ratio: f32) -> f32 {
+    if ratio <= 0.0 || baseline_ratio <= 0.0 { return 0.0; }
+    -ndir_ln_approx(ratio / baseline_ratio)
+}
+
+/// Padé-1 ln approximation with range-reduction.
+/// Accurate to ~1% for 0.5 < x < 2.0 (normal NDIR ratios).
+fn ndir_ln_approx(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    let mut val = x;
+    let mut adj = 0.0_f32;
+    while val > 2.0 { val *= 0.5; adj += core::f32::consts::LN_2; }
+    while val < 0.5 { val *= 2.0; adj -= core::f32::consts::LN_2; }
+    let t = val - 1.0;
+    2.0 * t / (val + 1.0) + adj
+}
+
 #[bsp::rt::entry]
 fn main() -> ! {
     let board::Resources {
@@ -315,15 +525,19 @@ fn main() -> ! {
     let mut p38 = gpio1.output(pins.p38);
     let _ = p38.set_low();
 
+    // IR LAMP for NDIR sensor (IR12EM) — Teensy pin D22 / A8
+    let mut ir_lamp = gpio1.output(pins.p22);
+    let _ = ir_lamp.set_low(); // Lamp starts OFF
+
 
     // ===================================================
     // PUMP 1 - motor driver BTS7960
     // ===================================================
     let mut pump1_l_en = gpio4.output(pins.p5);
-    let _ = pump1_l_en.set_high(); // Enable bridge L
-    
+    let _ = pump1_l_en.set_low(); // Disabled at boot
+
     let mut pump1_r_en = gpio4.output(pins.p4);
-    let _ = pump1_r_en.set_high(); // Enable bridge R
+    let _ = pump1_r_en.set_low(); // Disabled at boot
     
     let (mut pwm4, (_pwm4_sm0, _pwm4_sm1, mut pwm4_sm2, _pwm4_sm3)) = flexpwm4;
     pwm4_sm2.set_clock_select(flexpwm::ClockSelect::Ipg);
@@ -343,13 +557,18 @@ fn main() -> ! {
     pwm4_sm2.set_running(&mut pwm4, true);
 
     let mut set_pump1_pwm = |permille: u16| {
-        pump1_lpwm_out.set_output_enable(&mut pwm4, false);
+        // Swap: Matikan RPWM, jalankan LPWM untuk membalik arah putaran
+        pump1_rpwm_out.set_output_enable(&mut pwm4, false);
         if permille == 0 {
-            pump1_rpwm_out.set_output_enable(&mut pwm4, false);
+            pump1_lpwm_out.set_output_enable(&mut pwm4, false);
+            let _ = pump1_l_en.set_low(); // Disable bridge
+            let _ = pump1_r_en.set_low();
         } else {
-            pump1_rpwm_out.set_turn_off(&pwm4_sm2, pwm_permille_to_turn_off(permille));
+            let _ = pump1_l_en.set_high(); // Enable bridge
+            let _ = pump1_r_en.set_high();
+            pump1_lpwm_out.set_turn_off(&pwm4_sm2, pwm_permille_to_turn_off(permille));
             pwm4_sm2.set_load_ok(&mut pwm4);
-            pump1_rpwm_out.set_output_enable(&mut pwm4, true);
+            pump1_lpwm_out.set_output_enable(&mut pwm4, true);
         }
     };
     
@@ -367,10 +586,10 @@ fn main() -> ! {
     // polaritas pemasangan Peltier ke output OUT1/OUT2 modul BTS7960).
     // ===================================================
     let mut peltier_l_en = gpio2.output(pins.p9);
-    let _ = peltier_l_en.set_high();
+    let _ = peltier_l_en.set_low(); // Disabled at boot
 
     let mut peltier_r_en = gpio2.output(pins.p8);
-    let _ = peltier_r_en.set_high();
+    let _ = peltier_r_en.set_low(); // Disabled at boot
 
     let (mut pwm1, (_pwm1_sm0, _pwm1_sm1, _pwm1_sm2, mut pwm1_sm3)) = flexpwm1;
     let (mut pwm2, (_pwm2_sm0, _pwm2_sm1, mut pwm2_sm2, _pwm2_sm3)) = flexpwm2;
@@ -416,20 +635,32 @@ fn main() -> ! {
             ((-power) as u16, 0u16)
         };
 
-        if left_pct == 0 {
+        if left_pct == 0 && right_pct == 0 {
+            // Power = 0: matikan semua, termasuk EN
             lpwm_out.set_output_enable(&mut pwm1, false);
-        } else {
-            lpwm_out.set_turn_off(&pwm1_sm3, pwm_permille_to_turn_off(left_pct * 10));
-            pwm1_sm3.set_load_ok(&mut pwm1);
-            lpwm_out.set_output_enable(&mut pwm1, true);
-        }
-
-        if right_pct == 0 {
             rpwm_out.set_output_enable(&mut pwm2, false);
+            let _ = peltier_l_en.set_low(); // Disable bridge
+            let _ = peltier_r_en.set_low();
         } else {
-            rpwm_out.set_turn_off(&pwm2_sm2, pwm_permille_to_turn_off(right_pct * 10));
-            pwm2_sm2.set_load_ok(&mut pwm2);
-            rpwm_out.set_output_enable(&mut pwm2, true);
+            // Power != 0: nyalakan EN dulu, baru set PWM
+            let _ = peltier_l_en.set_high(); // Enable bridge
+            let _ = peltier_r_en.set_high();
+
+            if left_pct == 0 {
+                lpwm_out.set_output_enable(&mut pwm1, false);
+            } else {
+                lpwm_out.set_turn_off(&pwm1_sm3, pwm_permille_to_turn_off(left_pct * 10));
+                pwm1_sm3.set_load_ok(&mut pwm1);
+                lpwm_out.set_output_enable(&mut pwm1, true);
+            }
+
+            if right_pct == 0 {
+                rpwm_out.set_output_enable(&mut pwm2, false);
+            } else {
+                rpwm_out.set_turn_off(&pwm2_sm2, pwm_permille_to_turn_off(right_pct * 10));
+                pwm2_sm2.set_load_ok(&mut pwm2);
+                rpwm_out.set_output_enable(&mut pwm2, true);
+            }
         }
     };
 
@@ -452,8 +683,8 @@ fn main() -> ! {
     // kedua konstanta power di bawah, tidak perlu ubah logika suhunya.
     // ===================================================
     const PELTIER_HYSTERESIS_C: f32 = 0.5;
-    const PELTIER_COOL_POWER_PERCENT: i16 = 80;
-    const PELTIER_HEAT_POWER_PERCENT: i16 = 80;
+    const PELTIER_COOL_POWER_PERCENT: i16 = 100;
+    const PELTIER_HEAT_POWER_PERCENT: i16 = 100;
     let mut setpoint_c: f32 = 25.0;
     let mut peltier_mode: &str = "OFF";
 
@@ -462,6 +693,24 @@ fn main() -> ! {
 
     let mut setpoint_rx_buf = [0u8; 48];
     let mut setpoint_rx_len: usize = 0;
+
+    // ===================================================
+    // NDIR state machine + filters (IR12EM hydrocarbon sensor)
+    // ===================================================
+    let mut ndir = NdirState::new(NDIR_BASELINE_CYCLES);
+    let mut ndir_act_cf = NdirChannelFilter::new(NDIR_RAW_EMA_ALPHA);
+    let mut ndir_ref_cf = NdirChannelFilter::new(NDIR_RAW_EMA_ALPHA);
+    let mut ndir_proc_filt = NdirProcessedFilter::new(NDIR_PROC_EMA_ALPHA);
+    
+    // ===================================================
+    // EMA Filters for MOX Sensors (MQ & TGS series)
+    // ===================================================
+    // Index map:
+    // ADS0: 0=mq2, 1=mq3, 2=mq4, 3=mq5
+    // ADS1: 4=mq6, 5=mq7, 6=mq8, 7=mq135
+    // ADS2: 8=tgs2600, 9=tgs2611, 10=tgs2610, 11=tgs822
+    // ADS3: 12=tgs813, 13=mq9
+    let mut mox_filters = [NdirEma::new(MOX_EMA_ALPHA); 14];
 
     // ===================================================
     // SYSTEM LED
@@ -655,29 +904,29 @@ fn main() -> ! {
             // Handle Phases
             match phase_mode {
                 "IDLE" => {
-                    let _ = p14.set_high(); // Pump 2
-                    let _ = p38.set_high(); // SV1
+                    let _ = p41.set_high(); // Pump 3
                     let _ = p39.set_high(); // SV2
+                    let _ = p40.set_high(); // SV3
                     
-                    let _ = p40.set_low(); // SV3
-                    let _ = p41.set_low(); // Pump 3
+                    let _ = p14.set_low(); // Pump 2
+                    let _ = p38.set_low(); // SV1
                     set_pump1_pwm(0);
                 },
                 "INJECT" => {
                     set_pump1_pwm(pump1_pwm_val); // Pump 1
-                    let _ = p40.set_high(); // SV3
+                    let _ = p38.set_high(); // SV1
                     
                     let _ = p14.set_low(); // Pump 2
                     let _ = p41.set_low(); // Pump 3
-                    let _ = p38.set_low(); // SV1
+                    let _ = p40.set_low(); // SV3
                     let _ = p39.set_low(); // SV2
                 },
                 "PURGE" => {
                     let _ = p41.set_high(); // Pump 3
                     let _ = p39.set_high(); // SV2
-                    let _ = p38.set_high(); // SV1
+                    let _ = p40.set_high(); // SV3
                     
-                    let _ = p40.set_low(); // SV3
+                    let _ = p38.set_low(); // SV1
                     let _ = p14.set_low(); // Pump 2
                     set_pump1_pwm(0);
                 },
@@ -689,6 +938,78 @@ fn main() -> ! {
                     let _ = p41.set_low();
                     set_pump1_pwm(0);
                 }
+            }
+
+            // ===================================================
+            // NDIR CYCLE — one ON/OFF pair per loop iteration
+            // Lamp ON → 125 ms → read ACT/REF → lamp OFF → 125 ms → read ACT/REF → process
+            // Results stored in ndir_* vars, output with other sensors below.
+            // ===================================================
+            let mut _ndir_ratio:      f32 = 0.0;
+            let mut ndir_ratio_f:    f32 = 0.0;
+            let mut ndir_baseline:   f32 = 0.0;
+            let mut _ndir_response:   f32 = 0.0;
+            let mut ndir_response_f: f32 = 0.0;
+            let mut _ndir_abs:        f32 = 0.0;
+            let mut ndir_abs_f:      f32 = 0.0;
+            let mut ndir_bl_ready:   bool = false;
+            let mut ndir_valid:      bool = false;
+
+            if ads_ok[3] {
+                // Run 4 NDIR cycles (125ms ON, 125ms OFF) to make up ~1 second.
+                // This keeps the lamp thermally oscillating continuously at 4 Hz,
+                // while the rest of the sensors are reported at 1 Hz.
+                for _ in 0..4 {
+                    // ── ON phase ──────────────────────────────────────
+                    let _ = ir_lamp.set_high();
+                    delay.block_ms(NDIR_HALF_PERIOD_MS);
+
+                    select_pca(3, &mut delay);
+                    let ndir_act_on_raw = read_ads_raw(ChannelSelection::SingleA1).max(0) as u16;
+                    let ndir_ref_on_raw = read_ads_raw(ChannelSelection::SingleA2).max(0) as u16;
+
+                    // Filter ON readings (Median5 → EMA)
+                    ndir_act_cf.update(ndir_act_on_raw);
+                    ndir_ref_cf.update(ndir_ref_on_raw);
+                    let act_on_f = ndir_act_cf.filt_u16();
+                    let ref_on_f = ndir_ref_cf.filt_u16();
+
+                    // Store ON sample in state machine
+                    ndir.capture_on(act_on_f, ref_on_f);
+
+                    // ── OFF phase ─────────────────────────────────────
+                    let _ = ir_lamp.set_low();
+                    delay.block_ms(NDIR_HALF_PERIOD_MS);
+
+                    select_pca(3, &mut delay);
+                    let ndir_act_off_raw = read_ads_raw(ChannelSelection::SingleA1).max(0) as u16;
+                    let ndir_ref_off_raw = read_ads_raw(ChannelSelection::SingleA2).max(0) as u16;
+
+                    // Filter OFF readings
+                    ndir_act_cf.update(ndir_act_off_raw);
+                    ndir_ref_cf.update(ndir_ref_off_raw);
+                    let act_off_f = ndir_act_cf.filt_u16();
+                    let ref_off_f = ndir_ref_cf.filt_u16();
+
+                    // ── Process pair ──────────────────────────────────
+                    if let Some(s) = ndir.capture_off_and_process(act_off_f, ref_off_f) {
+                        let fp = ndir_proc_filt.update(
+                            s.ratio, s.response_pct, s.baseline_ratio,
+                        );
+                        _ndir_ratio      = s.ratio;
+                        ndir_ratio_f    = fp.ratio_filt;
+                        ndir_baseline   = s.baseline_ratio;
+                        _ndir_response   = s.response_pct;
+                        ndir_response_f = fp.response_filt;
+                        _ndir_abs        = fp.abs_raw;
+                        ndir_abs_f      = fp.abs_filt;
+                        ndir_bl_ready   = s.baseline_ready;
+                        ndir_valid      = true;
+                    }
+                }
+            } else {
+                // If NDIR sensor is offline, simulate the 1-second delay so the loop cadence is intact
+                delay.block_ms(1000);
             }
 
             // SENSOR VARIABLES (Raw i16)
@@ -715,37 +1036,37 @@ fn main() -> ! {
             // ADS0
             if ads_ok[0] {
                 select_pca(0, &mut delay);
-                mq2 = read_ads_raw(ChannelSelection::SingleA0);
-                mq3 = read_ads_raw(ChannelSelection::SingleA1);
-                mq4 = read_ads_raw(ChannelSelection::SingleA2);
-                mq5 = read_ads_raw(ChannelSelection::SingleA3);
+                mq2 = mox_filters[0].update_i16(read_ads_raw(ChannelSelection::SingleA0));
+                mq3 = mox_filters[1].update_i16(read_ads_raw(ChannelSelection::SingleA1));
+                mq4 = mox_filters[2].update_i16(read_ads_raw(ChannelSelection::SingleA2));
+                mq5 = mox_filters[3].update_i16(read_ads_raw(ChannelSelection::SingleA3));
             }
 
             // ADS1
             if ads_ok[1] {
                 select_pca(1, &mut delay);
-                mq6 = read_ads_raw(ChannelSelection::SingleA0);
-                mq7 = read_ads_raw(ChannelSelection::SingleA1);
-                mq8 = read_ads_raw(ChannelSelection::SingleA2);
-                mq135 = read_ads_raw(ChannelSelection::SingleA3);
+                mq6   = mox_filters[4].update_i16(read_ads_raw(ChannelSelection::SingleA0));
+                mq7   = mox_filters[5].update_i16(read_ads_raw(ChannelSelection::SingleA1));
+                mq8   = mox_filters[6].update_i16(read_ads_raw(ChannelSelection::SingleA2));
+                mq135 = mox_filters[7].update_i16(read_ads_raw(ChannelSelection::SingleA3));
             }
 
             // ADS2
             if ads_ok[2] {
                 select_pca(2, &mut delay);
-                tgs2600 = read_ads_raw(ChannelSelection::SingleA0);
-                tgs2611 = read_ads_raw(ChannelSelection::SingleA1);
-                tgs2610 = read_ads_raw(ChannelSelection::SingleA2);
-                tgs822 = read_ads_raw(ChannelSelection::SingleA3);
+                tgs2600 = mox_filters[8].update_i16(read_ads_raw(ChannelSelection::SingleA0));
+                tgs2611 = mox_filters[9].update_i16(read_ads_raw(ChannelSelection::SingleA1));
+                tgs2610 = mox_filters[10].update_i16(read_ads_raw(ChannelSelection::SingleA2));
+                tgs822  = mox_filters[11].update_i16(read_ads_raw(ChannelSelection::SingleA3));
             }
 
             // ADS3
             if ads_ok[3] {
                 select_pca(3, &mut delay);
-                tgs813 = read_ads_raw(ChannelSelection::SingleA0);
+                tgs813    = mox_filters[12].update_i16(read_ads_raw(ChannelSelection::SingleA0));
                 ir12emact = read_ads_raw(ChannelSelection::SingleA1);
                 ir12emref = read_ads_raw(ChannelSelection::SingleA2);
-                mq9 = read_ads_raw(ChannelSelection::SingleA3);
+                mq9       = mox_filters[13].update_i16(read_ads_raw(ChannelSelection::SingleA3));
             }
 
             // FORMAT UNTUK WEB FRONTEND (ADC0 - ADC15)
@@ -765,6 +1086,12 @@ fn main() -> ! {
             usb_println!("ADC12 = {}", mq7);
             usb_println!("ADC13 = {}", mq5);
             usb_println!("ADC14 = {}", ir12emact);
+            usb_println!("NDIR_VALID = {}", ndir_valid as u8);
+            usb_println!("NDIR_BL_READY = {}", ndir_bl_ready as u8);
+            usb_println!("NDIR_RATIO = {:.4}", ndir_ratio_f);
+            usb_println!("NDIR_BASELINE = {:.4}", ndir_baseline);
+            usb_println!("NDIR_RESPONSE = {:.2}", ndir_response_f);
+            usb_println!("NDIR_ABSORBANCE = {:.4}", ndir_abs_f);
             usb_println!("ADC15 = {}", ir12emref); // Pastikan ini selalu dicetak paling akhir untuk trigger frontend
 
             // SHT30-D read
@@ -807,8 +1134,6 @@ fn main() -> ! {
                 set_peltier_power(-PELTIER_HEAT_POWER_PERCENT);
                 peltier_mode = "HEAT";
             }
-            usb_println!("SETPOINT = {:.2} C", setpoint_c);
-            usb_println!("PELTIER_MODE = {}", peltier_mode);
 
             // SHT31 read (bus i2c1, pin 16/17)
             let mut sht31_temp = 0.0;
@@ -834,6 +1159,19 @@ fn main() -> ! {
 
             usb_println!("SHT31 Temp  = {:.2} C", sht31_temp);
             usb_println!("SHT31 Humi  = {:.2} %RH", sht31_hum);
+
+            // SAFETY LOGIC
+            if sht31_temp <= 15.0 || sht31_temp >= 40.0 || sht31_hum >= 85.0 {
+                set_peltier_power(0);
+                peltier_mode = "SAFETY_OFF";
+                let _ = p15.set_low(); // Fan OFF
+                usb_println!("SAFETY: Peltier & Fan D15 OFF (Out of bounds)");
+            } else {
+                let _ = p15.set_high(); // Fan ON
+            }
+            
+            usb_println!("SETPOINT = {:.2} C", setpoint_c);
+            usb_println!("PELTIER_MODE = {}", peltier_mode);
 
             // INA226 read (bus i2c1, 2x sensor arus)
             for i in 0..2 {
@@ -865,8 +1203,6 @@ fn main() -> ! {
                     power
                 );
             }
-
-            delay.block_ms(1000);
         }
     }
 }

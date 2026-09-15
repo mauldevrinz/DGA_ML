@@ -80,6 +80,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   const [recordingStartTime, setRecordingStartTime] = useState(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
   const [sessionData, setSessionData] = useState([]); // data captured during this recording session
+  const [baselines, setBaselines] = useState({}); // Stores R0 for normalization
+  const [saveGraphStatus, setSaveGraphStatus] = useState(''); // Status message for save graph
   const recordingRef = useRef(false); // ref to avoid stale closure in the data capture effect
   const dataSnapshotIndexRef = useRef(0); // tracks how much of dataHistory we've already captured
   
@@ -126,6 +128,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         ina1_v: 0.0, ina1_i: 0.0, ina1_p: 0.0,
         ina2_v: 0.0, ina2_i: 0.0, ina2_p: 0.0,
         setpoint_c: undefined, peltier_mode: undefined,
+        ndir_ratio: 0.0, ndir_abs: 0.0, ndir_resp: 0.0, ndir_baseline: 0.0,
+        flow_inlet: 0.0,
       };
       let lastUpdateTime = 0;
       
@@ -171,9 +175,39 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           updated = true;
         }
 
+        const matchFlow = line.match(/FLOW_INLET\s*=\s*(-?\d+\.?\d*)/);
+        if (matchFlow) {
+          currentData.flow_inlet = parseFloat(matchFlow[1]);
+          updated = true;
+        }
+
         const matchPeltierMode = line.match(/PELTIER_MODE\s*=\s*(\w+)/);
         if (matchPeltierMode) {
           currentData.peltier_mode = matchPeltierMode[1];
+          updated = true;
+        }
+
+        const matchNdirRatio = line.match(/NDIR_RATIO\s*=\s*(-?\d+\.\d+)/);
+        if (matchNdirRatio) {
+          currentData.ndir_ratio = parseFloat(matchNdirRatio[1]);
+          updated = true;
+        }
+
+        const matchNdirBaseline = line.match(/NDIR_BASELINE\s*=\s*(-?\d+\.\d+)/);
+        if (matchNdirBaseline) {
+          currentData.ndir_baseline = parseFloat(matchNdirBaseline[1]);
+          updated = true;
+        }
+
+        const matchNdirResp = line.match(/NDIR_RESPONSE\s*=\s*(-?\d+\.\d+)/);
+        if (matchNdirResp) {
+          currentData.ndir_resp = parseFloat(matchNdirResp[1]);
+          updated = true;
+        }
+
+        const matchNdirAbs = line.match(/NDIR_ABSORBANCE\s*=\s*(-?\d+\.\d+)/);
+        if (matchNdirAbs) {
+          currentData.ndir_abs = parseFloat(matchNdirAbs[1]);
           updated = true;
         }
 
@@ -405,6 +439,16 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     // Send PWM setting to Teensy
     sendCommand(`PWM=${pump1Pwm}`);
 
+    // Capture baseline (R0) from the latest available data point
+    const currentLatest = dataHistory.length > 0 ? dataHistory[dataHistory.length - 1] : null;
+    const newBaselines = {};
+    if (currentLatest) {
+      GAS_SENSORS.slice(0, 14).forEach((_, i) => {
+        newBaselines[`mos${i}`] = currentLatest[`mos${i}`] || 1; // Fallback to 1 to avoid div-by-zero
+      });
+    }
+    setBaselines(newBaselines);
+
     // Start recording
     setSessionData([]);
     dataSnapshotIndexRef.current = dataHistory.length;
@@ -432,6 +476,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       'temp_chamber_C', 'temp_oil_C', 'humidity_chamber_pct', 'humidity_oil_pct',
       'ina226_1_vbus_V', 'ina226_1_current_mA', 'ina226_1_power_W',
       'ina226_2_vbus_V', 'ina226_2_current_mA', 'ina226_2_power_W',
+      'ndir_ratio', 'ndir_baseline', 'ndir_response_pct', 'ndir_absorbance_au',
+      'flow_inlet'
     ];
     const csvRows = [headers.join(',')];
 
@@ -449,6 +495,11 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         (point.ina2_v ?? '').toString(),
         (point.ina2_i ?? '').toString(),
         (point.ina2_p ?? '').toString(),
+        (point.ndir_ratio ?? '').toString(),
+        (point.ndir_baseline ?? '').toString(),
+        (point.ndir_resp ?? '').toString(),
+        (point.ndir_abs ?? '').toString(),
+        (point.flow_inlet ?? '').toString(),
       ];
       csvRows.push(row.join(','));
     }
@@ -483,6 +534,64 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
   const latestData = dataHistory.length > 0 ? dataHistory[dataHistory.length - 1] : null;
 
+  const normalizedSessionData = React.useMemo(() => {
+    if (Object.keys(baselines).length === 0 || sessionData.length === 0) return [];
+    return sessionData.map(point => {
+      const normPoint = { time: point.time };
+      GAS_SENSORS.slice(0, 14).forEach((_, i) => {
+        const val = point[`mos${i}`] || 0;
+        const base = baselines[`mos${i}`] || 1;
+        normPoint[`mos${i}`] = val / base;
+      });
+      normPoint.ndir_abs = point.ndir_abs;
+      normPoint.ndir_resp = point.ndir_resp;
+      normPoint.ndir_ratio = point.ndir_ratio;
+      return normPoint;
+    });
+  }, [sessionData, baselines]);
+
+  const handleSaveGraph = useCallback(async () => {
+    if (normalizedSessionData.length === 0) return;
+    setSaveGraphStatus('⏳ Generating graph...');
+    try {
+      const ws = new WebSocket('ws://localhost:8080');
+      await new Promise((resolve, reject) => {
+        ws.onopen = resolve;
+        ws.onerror = reject;
+      });
+      const payload = JSON.stringify({
+        type: 'SAVE_GRAPH',
+        data: sessionData,
+        baselines: baselines,
+        sessionName: sessionName || 'session',
+        sensorNames: GAS_SENSORS.slice(0, 14),
+      });
+      const result = await new Promise((resolve, reject) => {
+        ws.onmessage = (e) => {
+          try { resolve(JSON.parse(e.data)); }
+          catch { resolve({ ok: false, error: e.data }); }
+        };
+        ws.onerror = reject;
+        ws.send(payload);
+      });
+      ws.close();
+      if (result.ok) {
+        setSaveGraphStatus(`✅ Graph saved: ${result.path}`);
+      } else {
+        setSaveGraphStatus(`❌ Error: ${result.error}`);
+      }
+    } catch (e) {
+      setSaveGraphStatus(`❌ Failed to connect to backend: ${e.message}`);
+    }
+  }, [normalizedSessionData, sessionData, baselines, sessionName]);
+
+  const handleResetData = () => {
+    setDataHistory([]);
+    setSessionData([]);
+    setBaselines({});
+    dataSnapshotIndexRef.current = 0;
+  };
+
   // Compute total system duration for display
   const totalSystemDuration = (idleDuration + injectDuration + purgeDuration) * 60;
 
@@ -501,7 +610,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             </button>
           )}
 
-          <button className="btn btn-secondary" onClick={() => setDataHistory([])}>
+          <button className="btn btn-secondary" onClick={handleResetData}>
             Reset Data
           </button>
 
@@ -563,6 +672,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           >
             <option value="grid">Grid View</option>
             <option value="combined">Combined Trend</option>
+            <option value="normalized">Normalized Trend</option>
           </select>
 
           <div className="divider-vert"></div>
@@ -578,6 +688,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               Mode: <strong style={{
                 color: latestData && latestData.peltier_mode === 'COOL' ? 'var(--accent-blue)'
                   : latestData && latestData.peltier_mode === 'HEAT' ? 'var(--status-error)'
+                  : latestData && latestData.peltier_mode === 'SAFETY_OFF' ? 'red'
                   : 'var(--text-muted)'
               }}>
                 {latestData && latestData.peltier_mode ? latestData.peltier_mode : '--'}
@@ -604,10 +715,10 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         </div>
       </div>
 
-      {viewMode === 'grid' ? (
+      {viewMode === 'grid' && (
         <div className="charts-grid-4x5">
-          {/* Render 16 Gas Sensors */}
-          {GAS_SENSORS.map((name, i) => (
+          {/* Render 14 MOX Gas Sensors (exclude raw IR12EM ACT/REF from UI) */}
+          {GAS_SENSORS.slice(0, 14).map((name, i) => (
             <MiniChart
               key={`mos${i}`}
               title={name}
@@ -698,13 +809,51 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             dataHistory={dataHistory}
             latestData={latestData}
           />
+          <MiniChart
+            title="IR12EM Absorbance"
+            dataKey="ndir_abs"
+            color="#FF5733"
+            domain={['auto', 'auto']}
+            unit="AU"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="IR12EM Response"
+            dataKey="ndir_resp"
+            color="#33FF57"
+            domain={['auto', 'auto']}
+            unit="%"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="IR12EM Ratio"
+            dataKey="ndir_ratio"
+            color="#3357FF"
+            domain={['auto', 'auto']}
+            unit="x"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="Flow Inlet"
+            dataKey="flow_inlet"
+            color="#2DD4BF"
+            domain={['auto', 'auto']}
+            unit="L/min"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
         </div>
-      ) : (
+      )}
+
+      {viewMode === 'combined' && (
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '20px' }}>
           {/* Large Combined Chart */}
           <div className="mini-chart-card" style={{ flex: 1, minHeight: '450px', display: 'flex', flexDirection: 'column' }}>
             <div className="chart-header" style={{ marginBottom: '10px' }}>
-              <span className="chart-title" style={{ fontSize: '18px' }}>Combined Gas Sensors Trend (mV)</span>
+              <span className="chart-title" style={{ fontSize: '18px', textTransform: 'none' }}>Combined Gas Sensors Trend (mV)</span>
             </div>
             <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
               {latestData ? (
@@ -712,14 +861,16 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                   <LineChart data={dataHistory} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
                     <XAxis dataKey="time" stroke="#75BDE0" />
-                    <YAxis domain={[0, 5000]} stroke="#75BDE0" />
+                    <YAxis yAxisId="left" domain={[0, 5000]} stroke="#75BDE0" />
+                    <YAxis yAxisId="right" orientation="right" domain={['auto', 'auto']} stroke="#FF5733" />
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
                       itemStyle={{ color: '#ffffff' }}
                     />
                     <Legend wrapperStyle={{ paddingTop: '20px' }} />
-                    {GAS_SENSORS.map((name, i) => (
+                    {GAS_SENSORS.slice(0, 14).map((name, i) => (
                       <Line
+                        yAxisId="left"
                         key={name}
                         type="monotone"
                         dataKey={`mos${i}`}
@@ -731,6 +882,10 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                         connectNulls={true}
                       />
                     ))}
+                    {/* IR12EM Sensors */}
+                    <Line yAxisId="right" type="monotone" dataKey="ndir_abs" name="IR12EM Absorbance (AU)" stroke="#FF5733" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
+                    <Line yAxisId="right" type="monotone" dataKey="ndir_resp" name="IR12EM Response (%)" stroke="#33FF57" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
+                    <Line yAxisId="right" type="monotone" dataKey="ndir_ratio" name="IR12EM Ratio (x)" stroke="#3357FF" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
@@ -785,7 +940,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
             <div className="mini-chart-card" style={{ flex: 1 }}>
               <div className="chart-header">
-                <span className="chart-title">Current Sensors (INA226)</span>
+                <span className="chart-title">Current Sensors & Flow</span>
               </div>
               <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
@@ -797,14 +952,69 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>INA226 #2 - Sensor + MCU (I / V):</span>
+                  <span style={{ color: 'var(--text-muted)' }}>INA226 #2 - Sensor+MCU (I / V):</span>
                   <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
                     {latestData && latestData.ina2_i !== undefined ? latestData.ina2_i.toFixed(2) : '--.--'} mA
                     {' / '}
                     {latestData && latestData.ina2_v !== undefined ? latestData.ina2_v.toFixed(3) : '--.---'} V
                   </span>
                 </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>Flow Inlet:</span>
+                  <span style={{ color: '#2DD4BF', fontWeight: 'bold' }}>
+                    {latestData && latestData.flow_inlet !== undefined ? latestData.flow_inlet.toFixed(2) : '--.--'} L/min
+                  </span>
+                </div>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {viewMode === 'normalized' && (
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '20px' }}>
+          <div className="mini-chart-card" style={{ flex: 1, minHeight: '450px', display: 'flex', flexDirection: 'column' }}>
+            <div className="chart-header" style={{ marginBottom: '10px' }}>
+              <span className="chart-title" style={{ fontSize: '18px', textTransform: 'none' }}>Normalized Gas Sensors Response (Rs/R0)</span>
+            </div>
+            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
+              {normalizedSessionData.length > 0 ? (
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                  <LineChart data={normalizedSessionData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
+                    <XAxis dataKey="time" stroke="#75BDE0" />
+                    <YAxis yAxisId="left" domain={['auto', 'auto']} stroke="#75BDE0" />
+                    <YAxis yAxisId="right" orientation="right" domain={['auto', 'auto']} stroke="#FF5733" />
+                    <Tooltip 
+                      contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
+                      itemStyle={{ color: '#ffffff' }}
+                    />
+                    <Legend wrapperStyle={{ paddingTop: '20px' }} />
+                    {GAS_SENSORS.slice(0, 14).map((name, i) => (
+                      <Line
+                        yAxisId="left"
+                        key={name}
+                        type="monotone"
+                        dataKey={`mos${i}`}
+                        name={name}
+                        stroke={GAS_COLORS[i % GAS_COLORS.length]}
+                        strokeWidth={2}
+                        dot={false}
+                        isAnimationActive={false}
+                        connectNulls={true}
+                      />
+                    ))}
+                    {/* IR12EM Sensors */}
+                    <Line yAxisId="right" type="monotone" dataKey="ndir_abs" name="IR12EM Absorbance (AU)" stroke="#FF5733" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
+                    <Line yAxisId="right" type="monotone" dataKey="ndir_resp" name="IR12EM Response (%)" stroke="#33FF57" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
+                    <Line yAxisId="right" type="monotone" dataKey="ndir_ratio" name="IR12EM Ratio (x)" stroke="#3357FF" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
+                  </LineChart>
+                </ResponsiveContainer>
+              ) : (
+                <div className="chart-empty" style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  Press 'Start System' to capture baseline and view normalized response.
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -944,10 +1154,20 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               <strong>{sessionData.length}</strong> data points recorded during session "<strong>{sessionName}</strong>".
             </p>
 
-            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center' }}>
+            {saveGraphStatus && (
+              <p style={{
+                fontSize: '13px',
+                marginBottom: '12px',
+                color: saveGraphStatus.startsWith('✅') ? '#16a34a' : saveGraphStatus.startsWith('⏳') ? '#d97706' : '#dc2626',
+              }}>
+                {saveGraphStatus}
+              </p>
+            )}
+
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'center', flexWrap: 'wrap' }}>
               <button
                 className="btn btn-outline"
-                onClick={() => setShowSavePopup(false)}
+                onClick={() => { setShowSavePopup(false); setSaveGraphStatus(''); }}
                 style={{ color: '#64748b', borderColor: '#CBD5E1' }}
               >
                 Close
@@ -961,6 +1181,14 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                 style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
               >
                 <Save size={16} /> Save as CSV
+              </button>
+              <button
+                className="btn btn-primary"
+                disabled={normalizedSessionData.length === 0 || saveGraphStatus.startsWith('⏳')}
+                onClick={handleSaveGraph}
+                style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#7c3aed', borderColor: '#7c3aed' }}
+              >
+                📊 Save Graph (PNG)
               </button>
             </div>
           </div>

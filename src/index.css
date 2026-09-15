@@ -149,13 +149,15 @@ button {
 }
 
 .status-badge.connected {
-  color: var(--status-normal);
-  border-color: rgba(117, 189, 224, 0.3);
-  background-color: rgba(117, 189, 224, 0.05);
+  color: #16a34a;
+  border-color: rgba(22, 163, 74, 0.3);
+  background-color: rgba(22, 163, 74, 0.08);
 }
 
 .status-badge.disconnected {
-  color: var(--text-muted);
+  color: var(--status-error);
+  border-color: rgba(239, 68, 68, 0.3);
+  background-color: rgba(239, 68, 68, 0.08);
 }
 
 .main-wrapper {
