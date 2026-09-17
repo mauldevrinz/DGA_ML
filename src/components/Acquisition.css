@@ -83,6 +83,7 @@
 .chart-area {
   flex: 1;
   position: relative;
+  min-height: 80px; /* Cegah Recharts mendapat height <= 0 (ResponsiveContainer warning) */
 }
 
 .chart-empty {

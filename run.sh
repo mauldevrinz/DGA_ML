@@ -6,7 +6,9 @@ set -e
 cleanup() {
     echo ""
     echo "🛑 Shutting down..."
-    kill $PYTHON_PID 2>/dev/null
+    if [ -n "${PYTHON_PID:-}" ]; then
+        kill "$PYTHON_PID" 2>/dev/null || true
+    fi
     exit 0
 }
 trap cleanup INT TERM
@@ -31,9 +33,18 @@ echo ""
 echo "====================================="
 echo "🐍 Menjalankan Python WebSocket Server (serial_ws.py)..."
 echo "====================================="
+if ! python3 -c "import numpy, skfuzzy, websockets, usb, requests" >/dev/null 2>&1; then
+    echo "❌ Dependensi Python belum lengkap."
+    echo "   Jalankan: python3 -m pip install -r requirements.txt"
+    exit 1
+fi
 python3 serial_ws.py &
 PYTHON_PID=$!
 sleep 2
+if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
+    echo "❌ Python WebSocket Server gagal dijalankan."
+    exit 1
+fi
 
 echo ""
 echo "====================================="

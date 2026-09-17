@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, Square, Plug, Save, Settings } from 'lucide-react';
+import { Play, Square, Save } from 'lucide-react';
+import PropTypes from 'prop-types';
 import { useLocalStorage } from '../hooks/useLocalStorage';
 import { LineChart, Line, YAxis, XAxis, Tooltip, Legend, ResponsiveContainer, CartesianGrid } from 'recharts';
 import './Acquisition.css';
@@ -33,9 +34,9 @@ const MiniChart = React.memo(({ title, dataKey, color, domain, unit, dataHistory
           {latestData && latestData[dataKey] !== undefined ? latestVal.toFixed(decimals) : placeholder} {unit}
         </span>
       </div>
-      <div className="chart-area" style={{ minWidth: 0, minHeight: 0 }}>
+      <div className="chart-area" style={{ minWidth: 0, minHeight: '80px' }}>
         {latestData ? (
-          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={80}>
             <LineChart data={dataHistory}>
               <CartesianGrid strokeDasharray="2 2" vertical={false} stroke="#e2e8f0" />
               <XAxis dataKey="time" hide={true} />
@@ -58,20 +59,35 @@ const MiniChart = React.memo(({ title, dataKey, color, domain, unit, dataHistory
     </div>
   );
 });
+MiniChart.displayName = 'MiniChart';
+MiniChart.propTypes = {
+  title: PropTypes.string.isRequired,
+  dataKey: PropTypes.string.isRequired,
+  color: PropTypes.string.isRequired,
+  domain: PropTypes.array.isRequired,
+  unit: PropTypes.string.isRequired,
+  dataHistory: PropTypes.array.isRequired,
+  latestData: PropTypes.object,
+};
 
 const Acquisition = ({ isConnected, setIsConnected }) => {
-  const [ports, setPorts] = useState([]);
-  const [selectedPort, setSelectedPort] = useState('');
   const [dataHistory, setDataHistory] = useState([]);
   const [viewMode, setViewMode] = useLocalStorage('dga_viewMode', 'grid');
   
   // Serial Port states
   const [serialPort, setSerialPort] = useState(null);
   const serialPortRef = useRef(null);
-  const [abortController, setAbortController] = useState(null);
+
+  // Pending SAVE_GRAPH response callback (resolve/reject dari koneksi WS yang ada)
+  // Menghindari buka WS baru yang langsung menerima broadcast Teensy sebelum response SAVE_GRAPH
+  const saveGraphPendingRef = useRef(null);
 
   // Peltier setpoint control
   const [setpointInput, setSetpointInput] = useState('25.0');
+  const [showChamberPopup, setShowChamberPopup] = useState(false);
+  const [chamberKp, setChamberKp] = useState('5.0');
+  const [chamberKi, setChamberKi] = useState('0.5');
+  const [chamberKd, setChamberKd] = useState('1.0');
   
   // Session / Recording states
   const [sessionName, setSessionName] = useLocalStorage('dga_sessionName', '');
@@ -105,13 +121,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   // ===== SAVE POPUP after system completes =====
   const [showSavePopup, setShowSavePopup] = useState(false);
 
-  useEffect(() => {
-    setPorts([
-      { name: 'Web Serial API', description: 'Teensy 4.1 USB Serial', is_teensy: true },
-    ]);
-    setSelectedPort('Web Serial API');
-  }, []);
-
   const connectSerial = () => {
     try {
       const host = window.location.hostname || '127.0.0.1';
@@ -127,6 +136,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         time: 0, temp0: 0.0, temp1: 0.0, hum0: 0.0, hum1: 0.0,
         ina1_v: 0.0, ina1_i: 0.0, ina1_p: 0.0,
         ina2_v: 0.0, ina2_i: 0.0, ina2_p: 0.0,
+        kria_v: 0.0, kria_i: 0.0, kria_p: 0.0,
         setpoint_c: undefined, peltier_mode: undefined,
         ndir_ratio: 0.0, ndir_abs: 0.0, ndir_resp: 0.0, ndir_baseline: 0.0,
         flow_inlet: 0.0,
@@ -135,6 +145,19 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       
       ws.onmessage = (event) => {
         const line = event.data;
+
+        if (typeof line === 'string' && line.trimStart().startsWith('{')) {
+          try {
+            const json = JSON.parse(line);
+            if (saveGraphPendingRef.current) {
+              saveGraphPendingRef.current.resolve(json);
+              saveGraphPendingRef.current = null;
+            }
+          } catch (_) {
+          }
+          return;
+        }
+
         let updated = false;
 
         const match = line.match(/ADC(\d+)\s*=\s*(-?\d+)/);
@@ -211,13 +234,11 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           updated = true;
         }
 
-        // Format aktual dari firmware (lihat usb_println! di src/main.rs):
-        // "INA226_1 Vbus = 11.702 V, Vshunt = 0.02616 V, I = 5.2315 A, P = 61.2375 W"
         const matchIna = line.match(/INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.?\d*)\s*V,\s*Vshunt\s*=\s*(-?\d+\.?\d*)\s*V,\s*I\s*=\s*(-?\d+\.?\d*)\s*A,\s*P\s*=\s*(-?\d+\.?\d*)\s*W/);
         if (matchIna) {
           const inaIndex = parseInt(matchIna[1]);
           const vbus = parseFloat(matchIna[2]);
-          const currentMa = parseFloat(matchIna[4]) * 1000; // firmware kirim A, GUI pakai mA
+          const currentMa = parseFloat(matchIna[4]) * 1000;
           const power = parseFloat(matchIna[5]);
           if (inaIndex === 1) {
             currentData.ina1_v = vbus;
@@ -231,6 +252,14 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           updated = true;
         }
         
+        const matchKria = line.match(/KRIA Vbus=([0-9.]+)V I=([0-9.]+)A P=([0-9.]+)W/);
+        if (matchKria) {
+          currentData.kria_v = parseFloat(matchKria[1]);
+          currentData.kria_i = parseFloat(matchKria[2]) * 1000;
+          currentData.kria_p = parseFloat(matchKria[3]);
+          updated = true;
+        }
+        
         if (updated && currentData.mos15 !== undefined) {
            const now = Date.now();
            if (now - lastUpdateTime >= 1000) {
@@ -240,9 +269,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                 return [...prev, { ...currentData }];
              });
            }
-           // Carry every field forward (including mos0..mos15) so a sensor
-           // that doesn't get a fresh reading this cycle keeps its last
-           // known value instead of going undefined and breaking the line.
            currentData = { ...currentData, time: 0 };
         }
       };
@@ -289,8 +315,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     }
   }, []);
 
-  // --- Send temperature setpoint to the Teensy (Peltier bang-bang controller) ---
-  const sendSetpoint = useCallback(() => {
+  // --- Send chamber config to Kria (Fuzzy PID) and Teensy ---
+  const sendChamberConfig = useCallback(() => {
     if (!serialPort || serialPort.readyState !== WebSocket.OPEN) {
       alert('Please connect to the backend (Start Stream) first.');
       return;
@@ -302,11 +328,19 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     }
 
     try {
-      serialPort.send(`SETPOINT=${value.toFixed(2)}\n`);
+      const payload = {
+        type: 'CHAMBER_CTRL',
+        setpoint: value,
+        kp: parseFloat(chamberKp),
+        ki: parseFloat(chamberKi),
+        kd: parseFloat(chamberKd)
+      };
+      serialPort.send(JSON.stringify(payload));
+      setShowChamberPopup(false);
     } catch (e) {
       console.error(e);
     }
-  }, [serialPort, setpointInput]);
+  }, [serialPort, setpointInput, chamberKp, chamberKi, chamberKd]);
 
   // --- Recording logic: capture new dataHistory entries into sessionData ---
   useEffect(() => {
@@ -476,6 +510,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       'temp_chamber_C', 'temp_oil_C', 'humidity_chamber_pct', 'humidity_oil_pct',
       'ina226_1_vbus_V', 'ina226_1_current_mA', 'ina226_1_power_W',
       'ina226_2_vbus_V', 'ina226_2_current_mA', 'ina226_2_power_W',
+      'kria_vbus_V', 'kria_current_mA', 'kria_power_W',
       'ndir_ratio', 'ndir_baseline', 'ndir_response_pct', 'ndir_absorbance_au',
       'flow_inlet'
     ];
@@ -495,6 +530,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         (point.ina2_v ?? '').toString(),
         (point.ina2_i ?? '').toString(),
         (point.ina2_p ?? '').toString(),
+        (point.kria_v ?? '').toString(),
+        (point.kria_i ?? '').toString(),
+        (point.kria_p ?? '').toString(),
         (point.ndir_ratio ?? '').toString(),
         (point.ndir_baseline ?? '').toString(),
         (point.ndir_resp ?? '').toString(),
@@ -538,7 +576,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     if (Object.keys(baselines).length === 0 || sessionData.length === 0) return [];
     return sessionData.map(point => {
       const normPoint = { time: point.time };
-      GAS_SENSORS.slice(0, 14).forEach((_, i) => {
+      GAS_SENSORS.slice(0, 14).forEach((sensor, i) => {
         const val = point[`mos${i}`] || 0;
         const base = baselines[`mos${i}`] || 1;
         normPoint[`mos${i}`] = val / base;
@@ -551,37 +589,55 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   }, [sessionData, baselines]);
 
   const handleSaveGraph = useCallback(async () => {
-    if (normalizedSessionData.length === 0) return;
+    if (normalizedSessionData.length === 0) {
+      setSaveGraphStatus('❌ Tidak ada data sesi. Jalankan sistem terlebih dahulu.');
+      return;
+    }
+    const ws = serialPortRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      setSaveGraphStatus('❌ Tidak terkoneksi ke backend. Hubungkan stream terlebih dahulu.');
+      return;
+    }
+
     setSaveGraphStatus('⏳ Generating graph...');
     try {
-      const ws = new WebSocket('ws://localhost:8080');
-      await new Promise((resolve, reject) => {
-        ws.onopen = resolve;
-        ws.onerror = reject;
-      });
-      const payload = JSON.stringify({
-        type: 'SAVE_GRAPH',
-        data: sessionData,
-        baselines: baselines,
-        sessionName: sessionName || 'session',
-        sensorNames: GAS_SENSORS.slice(0, 14),
-      });
       const result = await new Promise((resolve, reject) => {
-        ws.onmessage = (e) => {
-          try { resolve(JSON.parse(e.data)); }
-          catch { resolve({ ok: false, error: e.data }); }
+        // Timeout 15 detik agar tidak stuck selamanya
+        const timeout = setTimeout(() => {
+          saveGraphPendingRef.current = null;
+          reject(new Error('Timeout: backend tidak merespon dalam 15 detik'));
+        }, 15000);
+
+        saveGraphPendingRef.current = {
+          resolve: (val) => { clearTimeout(timeout); resolve(val); },
+          reject:  (err) => { clearTimeout(timeout); reject(err); },
         };
-        ws.onerror = reject;
+
+        const payload = JSON.stringify({
+          type: 'SAVE_GRAPH',
+          data: sessionData,
+          baselines: baselines,
+          sessionName: sessionName || 'session',
+          sensorNames: GAS_SENSORS.slice(0, 14),
+        });
         ws.send(payload);
       });
-      ws.close();
+
       if (result.ok) {
-        setSaveGraphStatus(`✅ Graph saved: ${result.path}`);
+        // Handle client-side download using base64 from backend
+        const a = document.createElement('a');
+        a.href = `data:image/png;base64,${result.b64_image}`;
+        a.download = result.filename || 'DGA_Graph.png';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setSaveGraphStatus(`✅ Graph didownload!`);
       } else {
         setSaveGraphStatus(`❌ Error: ${result.error}`);
       }
     } catch (e) {
-      setSaveGraphStatus(`❌ Failed to connect to backend: ${e.message}`);
+      saveGraphPendingRef.current = null;
+      setSaveGraphStatus(`❌ ${e.message}`);
     }
   }, [normalizedSessionData, sessionData, baselines, sessionName]);
 
@@ -591,9 +647,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     setBaselines({});
     dataSnapshotIndexRef.current = 0;
   };
-
-  // Compute total system duration for display
-  const totalSystemDuration = (idleDuration + injectDuration + purgeDuration) * 60;
 
   return (
     <div className="page-container">
@@ -695,22 +748,13 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               </strong>
             </span>
           </div>
-          <input
-            type="number"
-            step="0.1"
-            className="select-input"
-            style={{ width: '90px' }}
-            value={setpointInput}
-            onChange={(e) => setSetpointInput(e.target.value)}
-            placeholder="°C"
-          />
           <button
             className="btn btn-primary"
-            onClick={sendSetpoint}
+            onClick={() => setShowChamberPopup(true)}
             disabled={!isConnected}
-            title={!isConnected ? 'Connect to serial first' : 'Send setpoint to Teensy'}
+            title={!isConnected ? 'Connect to serial first' : 'Configure Chamber PID'}
           >
-            Set
+            Chamber Control
           </button>
         </div>
       </div>
@@ -742,7 +786,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart 
-            title="TEMP OIL VESSEL"
+            title="TEMP SAMPLE CHAMBER"
             dataKey="temp1"
             color="var(--accent-blue)"
             domain={[0, 100]}
@@ -762,7 +806,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="HUM OIL VESSEL"
+            title="HUM SAMPLE CHAMBER"
             dataKey="hum1"
             color="var(--status-normal)"
             domain={[0, 100]}
@@ -774,7 +818,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           {/* INA226 Current Sensors: #1 mengukur arus & tegangan aktuator,
               #2 mengukur arus & tegangan suplai sensor + mikrokontroller */}
           <MiniChart
-            title="INA226 #1 CURRENT (ACTUATOR)"
+            title="ACTUATOR CURRENT"
             dataKey="ina1_i"
             color="var(--accent-orange)"
             domain={['auto', 'auto']}
@@ -783,7 +827,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="INA226 #1 VOLTAGE (ACTUATOR)"
+            title="ACTUATOR VOLTAGE"
             dataKey="ina1_v"
             color="var(--accent-blue)"
             domain={['auto', 'auto']}
@@ -792,7 +836,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="INA226 #2 CURRENT (SENSOR+MCU)"
+            title="SENSOR HEATER CURRENT"
             dataKey="ina2_i"
             color="var(--accent-orange)"
             domain={['auto', 'auto']}
@@ -801,8 +845,26 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
           <MiniChart
-            title="INA226 #2 VOLTAGE (SENSOR+MCU)"
+            title="SENSOR HEATER VOLTAGE"
             dataKey="ina2_v"
+            color="var(--accent-blue)"
+            domain={['auto', 'auto']}
+            unit="V"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="KRIA SOM CURRENT"
+            dataKey="kria_i"
+            color="var(--accent-orange)"
+            domain={['auto', 'auto']}
+            unit="mA"
+            dataHistory={dataHistory}
+            latestData={latestData}
+          />
+          <MiniChart
+            title="KRIA SOM VOLTAGE"
+            dataKey="kria_v"
             color="var(--accent-blue)"
             domain={['auto', 'auto']}
             unit="V"
@@ -855,9 +917,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             <div className="chart-header" style={{ marginBottom: '10px' }}>
               <span className="chart-title" style={{ fontSize: '18px', textTransform: 'none' }}>Combined Gas Sensors Trend (mV)</span>
             </div>
-            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
+            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: '300px' }}>
               {latestData ? (
-                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={300}>
                   <LineChart data={dataHistory} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
                     <XAxis dataKey="time" stroke="#75BDE0" />
@@ -900,7 +962,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           <div style={{ display: 'flex', gap: '20px' }}>
             <div className="mini-chart-card" style={{ flex: 1 }}>
               <div className="chart-header">
-                <span className="chart-title">Chamber Conditions</span>
+                <span className="chart-title">Sensor Chamber Conditions</span>
               </div>
               <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
@@ -920,17 +982,17 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
             <div className="mini-chart-card" style={{ flex: 1 }}>
               <div className="chart-header">
-                <span className="chart-title">Oil Vessel Conditions</span>
+                <span className="chart-title">Sample Chamber Conditions</span>
               </div>
               <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>TEMP OIL VESSEL:</span>
+                  <span style={{ color: 'var(--text-muted)' }}>TEMP SAMPLE CHAMBER:</span>
                   <span style={{ color: 'var(--accent-blue)', fontWeight: 'bold' }}>
                     {latestData && latestData.temp1 !== undefined ? latestData.temp1.toFixed(2) : '--.--'} °C
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>HUM OIL VESSEL:</span>
+                  <span style={{ color: 'var(--text-muted)' }}>HUM SAMPLE CHAMBER:</span>
                   <span style={{ color: 'var(--status-normal)', fontWeight: 'bold' }}>
                     {latestData && latestData.hum1 !== undefined ? latestData.hum1.toFixed(2) : '--.--'} %
                   </span>
@@ -944,19 +1006,33 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               </div>
               <div style={{ marginTop: '10px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>INA226 #1 - Actuator (I / V):</span>
+                  <span style={{ color: 'var(--text-muted)' }}>ACTUATOR (I/V/P):</span>
                   <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
-                    {latestData && latestData.ina1_i !== undefined ? latestData.ina1_i.toFixed(2) : '--.--'} mA
+                    {latestData && latestData.ina1_i !== undefined ? latestData.ina1_i.toFixed(0) : '--'} mA
                     {' / '}
-                    {latestData && latestData.ina1_v !== undefined ? latestData.ina1_v.toFixed(3) : '--.---'} V
+                    {latestData && latestData.ina1_v !== undefined ? latestData.ina1_v.toFixed(2) : '--.--'} V
+                    {' / '}
+                    {latestData && latestData.ina1_p !== undefined ? latestData.ina1_p.toFixed(2) : '--.--'} W
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
-                  <span style={{ color: 'var(--text-muted)' }}>INA226 #2 - Sensor+MCU (I / V):</span>
+                  <span style={{ color: 'var(--text-muted)' }}>SENSOR HEATER (I/V/P):</span>
                   <span style={{ color: 'var(--accent-orange)', fontWeight: 'bold' }}>
-                    {latestData && latestData.ina2_i !== undefined ? latestData.ina2_i.toFixed(2) : '--.--'} mA
+                    {latestData && latestData.ina2_i !== undefined ? latestData.ina2_i.toFixed(0) : '--'} mA
                     {' / '}
-                    {latestData && latestData.ina2_v !== undefined ? latestData.ina2_v.toFixed(3) : '--.---'} V
+                    {latestData && latestData.ina2_v !== undefined ? latestData.ina2_v.toFixed(2) : '--.--'} V
+                    {' / '}
+                    {latestData && latestData.ina2_p !== undefined ? latestData.ina2_p.toFixed(2) : '--.--'} W
+                  </span>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
+                  <span style={{ color: 'var(--text-muted)' }}>KRIA MAIN (I/V/P):</span>
+                  <span style={{ color: 'var(--status-normal)', fontWeight: 'bold' }}>
+                    {latestData && latestData.kria_i !== undefined ? latestData.kria_i.toFixed(0) : '--'} mA
+                    {' / '}
+                    {latestData && latestData.kria_v !== undefined ? latestData.kria_v.toFixed(2) : '--.--'} V
+                    {' / '}
+                    {latestData && latestData.kria_p !== undefined ? latestData.kria_p.toFixed(2) : '--.--'} W
                   </span>
                 </div>
                 <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '16px' }}>
@@ -977,9 +1053,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             <div className="chart-header" style={{ marginBottom: '10px' }}>
               <span className="chart-title" style={{ fontSize: '18px', textTransform: 'none' }}>Normalized Gas Sensors Response (Rs/R0)</span>
             </div>
-            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: 0 }}>
+            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: '300px' }}>
               {normalizedSessionData.length > 0 ? (
-                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={300}>
                   <LineChart data={normalizedSessionData} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
                     <XAxis dataKey="time" stroke="#75BDE0" />
@@ -1141,18 +1217,63 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         </div>
       )}
 
+      {/* ===== CHAMBER CONTROL POPUP ===== */}
+      {showChamberPopup && (
+        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '380px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)' }}>
+            <h3 style={{ margin: '0 0 16px 0', color: '#0f172a', fontSize: '20px', textAlign: 'center' }}>Chamber PID Control</h3>
+            
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '12px', marginBottom: '24px' }}>
+              <div>
+                <label style={{ display: 'block', marginBottom: '4px', fontSize: '14px', fontWeight: 600 }}>Setpoint (°C)</label>
+                <input type="number" step="0.1" value={setpointInput} onChange={(e) => setSetpointInput(e.target.value)} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1' }} />
+              </div>
+              <div style={{ display: 'flex', gap: '12px' }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', marginBottom: '4px', fontSize: '14px', fontWeight: 600 }}>Kp</label>
+                  <input type="number" step="0.1" value={chamberKp} onChange={(e) => setChamberKp(e.target.value)} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1' }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', marginBottom: '4px', fontSize: '14px', fontWeight: 600 }}>Ki</label>
+                  <input type="number" step="0.1" value={chamberKi} onChange={(e) => setChamberKi(e.target.value)} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1' }} />
+                </div>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: 'block', marginBottom: '4px', fontSize: '14px', fontWeight: 600 }}>Kd</label>
+                  <input type="number" step="0.1" value={chamberKd} onChange={(e) => setChamberKd(e.target.value)} style={{ width: '100%', padding: '8px', borderRadius: '6px', border: '1px solid #cbd5e1' }} />
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '12px', justifyContent: 'flex-end' }}>
+              <button 
+                onClick={() => setShowChamberPopup(false)}
+                style={{ padding: '8px 16px', backgroundColor: '#f1f5f9', color: '#475569', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600 }}
+              >
+                Cancel
+              </button>
+              <button 
+                onClick={sendChamberConfig}
+                style={{ padding: '8px 16px', backgroundColor: '#0ea5e9', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: 600 }}
+              >
+                Apply
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* ===== SAVE DATA POPUP (after system completes) ===== */}
       {showSavePopup && (
-        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '460px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)', textAlign: 'center' }}>
-            <div style={{ fontSize: '48px', marginBottom: '12px' }}>✅</div>
-            <h3 style={{ margin: '0 0 8px 0', color: '#0f172a', fontSize: '20px' }}>System Phases Completed!</h3>
-            <p style={{ color: '#475569', marginBottom: '6px' }}>
-              All phases (Idle → Injecting → Purging) have finished.
-            </p>
-            <p style={{ color: '#64748b', fontSize: '14px', marginBottom: '20px' }}>
-              <strong>{sessionData.length}</strong> data points recorded during session "<strong>{sessionName}</strong>".
-            </p>
+      <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
+        <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '460px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)', textAlign: 'center' }}>
+          <div style={{ fontSize: '48px', marginBottom: '12px' }}>✅</div>
+          <h3 style={{ margin: '0 0 8px 0', color: '#0f172a', fontSize: '20px' }}>System Phases Completed!</h3>
+          <p style={{ color: '#475569', marginBottom: '6px' }}>
+            All phases (Idle &rarr; Injecting &rarr; Purging) have finished.
+          </p>
+          <p style={{ color: '#64748b', fontSize: '14px', marginBottom: '20px' }}>
+            <strong>{sessionData.length}</strong> data points recorded during session &quot;<strong>{sessionName}</strong>&quot;.
+          </p>
 
             {saveGraphStatus && (
               <p style={{
@@ -1199,6 +1320,11 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
     </div>
   );
+};
+
+Acquisition.propTypes = {
+  isConnected: PropTypes.bool.isRequired,
+  setIsConnected: PropTypes.func.isRequired,
 };
 
 export default Acquisition;

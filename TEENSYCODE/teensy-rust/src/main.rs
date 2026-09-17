@@ -64,6 +64,7 @@ fn pwm_permille_to_turn_off(permille: u16) -> i16 {
         Setpoint(f32),
         Phase(&'static str),
         Pump1Pwm(u16),
+        Pwr(i16),
     }
 
 struct UsbComm<'a> {
@@ -120,34 +121,40 @@ impl<'a> UsbComm<'a> {
     /// baru kalau baris SETPOINT valid baru saja selesai diterima.
     fn poll_cmd(&mut self, rx_buf: &mut [u8], rx_len: &mut usize) -> Option<HostCmd> {
         self.poll();
-        let mut chunk = [0u8; 32];
+        let mut chunk = [0u8; 64];
         let n = self.serial.read(&mut chunk).unwrap_or(0);
-        let mut result = None;
+        if n == 0 {
+            return None;
+        }
+        let mut result: Option<HostCmd> = None;
         for &b in &chunk[..n] {
             if b == b'\n' || b == b'\r' {
                 if *rx_len > 0 {
                     if let Ok(line) = core::str::from_utf8(&rx_buf[..*rx_len]) {
                         let line = line.trim();
-                        if let Some(rest) = line.strip_prefix("SETPOINT=") {
-                            if let Ok(val) = rest.trim().parse::<f32>() {
-                                result = Some(HostCmd::Setpoint(val));
-                            }
+                        let parsed = if let Some(rest) = line.strip_prefix("SETPOINT=") {
+                            rest.trim().parse::<f32>().ok().map(HostCmd::Setpoint)
                         } else if let Some(rest) = line.strip_prefix("PHASE=") {
                             match rest.trim() {
-                                "IDLE" => result = Some(HostCmd::Phase("IDLE")),
-                                "INJECT" => result = Some(HostCmd::Phase("INJECT")),
-                                "PURGE" => result = Some(HostCmd::Phase("PURGE")),
-                                "OFF" => result = Some(HostCmd::Phase("OFF")),
-                                _ => {}
+                                "IDLE" => Some(HostCmd::Phase("IDLE")),
+                                "INJECT" => Some(HostCmd::Phase("INJECT")),
+                                "PURGE" => Some(HostCmd::Phase("PURGE")),
+                                "OFF" => Some(HostCmd::Phase("OFF")),
+                                _ => None,
                             }
                         } else if let Some(rest) = line.strip_prefix("PWM=") {
-                            if let Ok(val) = rest.trim().parse::<u16>() {
-                                result = Some(HostCmd::Pump1Pwm(val));
-                            }
+                            rest.trim().parse::<u16>().ok().map(HostCmd::Pump1Pwm)
+                        } else if let Some(rest) = line.strip_prefix("PWR=") {
+                            rest.trim().parse::<i16>().ok().map(HostCmd::Pwr)
+                        } else {
+                            None
+                        };
+                        if parsed.is_some() {
+                            result = parsed;
                         }
                     }
-                    *rx_len = 0;
                 }
+                *rx_len = 0;
             } else if *rx_len < rx_buf.len() {
                 rx_buf[*rx_len] = b;
                 *rx_len += 1;
@@ -169,6 +176,73 @@ static USB_COMM: Mutex<RefCell<Option<UsbComm<'static>>>> = Mutex::new(RefCell::
 
 fn with_usb_comm<R>(f: impl FnOnce(&mut UsbComm<'static>) -> R) -> Option<R> {
     cortex_m::interrupt::free(|cs| USB_COMM.borrow(cs).borrow_mut().as_mut().map(f))
+}
+
+macro_rules! process_usb_commands {
+    ($rx_buf:expr, $rx_len:expr, $setpoint:expr, $phase:expr, $pump1_pwm:expr, $pwr_mode:expr, $pwr_val:expr, $set_pump_fn:expr, $p41:expr, $p39:expr, $p40:expr, $p14:expr, $p38:expr) => {
+        while let Some(cmd) = with_usb_comm(|comm| comm.poll_cmd($rx_buf, $rx_len)).flatten() {
+            match cmd {
+                HostCmd::Setpoint(val) => {
+                    $setpoint = val;
+                    $pwr_mode = false;
+                    usb_println!("ACK SETPOINT = {:.2} C", $setpoint);
+                },
+                HostCmd::Phase(p) => {
+                    $phase = p;
+                    usb_println!("ACK PHASE = {}", p);
+                    
+                    // Handle Phases immediately
+                    match $phase {
+                        "IDLE" => {
+                            let _ = $p41.set_high(); // Pump 3 ON
+                            let _ = $p39.set_high(); // SV2
+                            let _ = $p40.set_high(); // SV3
+                            let _ = $p14.set_high(); // Pump 2 ON
+                            let _ = $p38.set_low(); // SV1
+                            $set_pump_fn(0);
+                        },
+                        "INJECT" => {
+                            $set_pump_fn($pump1_pwm); // Pump 1
+                            let _ = $p38.set_high(); // SV1
+                            let _ = $p14.set_low(); // Pump 2
+                            let _ = $p41.set_low(); // Pump 3
+                            let _ = $p40.set_low(); // SV3
+                            let _ = $p39.set_low(); // SV2
+                        },
+                        "PURGE" => {
+                            let _ = $p41.set_high(); // Pump 3 ON
+                            let _ = $p39.set_high(); // SV2
+                            let _ = $p40.set_high(); // SV3
+                            let _ = $p38.set_low(); // SV1
+                            let _ = $p14.set_high(); // Pump 2 ON
+                            $set_pump_fn(0);
+                        },
+                        _ => { // OFF
+                            let _ = $p14.set_low();
+                            let _ = $p38.set_low();
+                            let _ = $p39.set_low();
+                            let _ = $p40.set_low();
+                            let _ = $p41.set_low();
+                            $set_pump_fn(0);
+                        }
+                    }
+                },
+                HostCmd::Pump1Pwm(val) => {
+                    let val_permille = (val.min(100) as u16) * 10;
+                    $pump1_pwm = val_permille;
+                    usb_println!("ACK PWM = {}%", val.min(100));
+                    if $phase == "INJECT" {
+                        $set_pump_fn($pump1_pwm);
+                    }
+                },
+                HostCmd::Pwr(val) => {
+                    $pwr_mode = true;
+                    $pwr_val = val;
+                    usb_println!("ACK PWR = {}", val);
+                }
+            }
+        }
+    }
 }
 
 #[bsp::rt::interrupt]
@@ -424,6 +498,116 @@ fn ndir_ln_approx(x: f32) -> f32 {
     2.0 * t / (val + 1.0) + adj
 }
 
+// ===================================================
+// FUZZY PID CONTROLLER
+// ===================================================
+fn f32_min(a: f32, b: f32) -> f32 { if a < b { a } else { b } }
+fn f32_max(a: f32, b: f32) -> f32 { if a > b { a } else { b } }
+fn f32_clamp(v: f32, min: f32, max: f32) -> f32 { f32_min(f32_max(v, min), max) }
+
+struct FuzzyPid {
+    kp0: f32,
+    ki0: f32,
+    kd0: f32,
+    integral: f32,
+    last_error: f32,
+}
+
+impl FuzzyPid {
+    fn new(kp0: f32, ki0: f32, kd0: f32) -> Self {
+        Self {
+            kp0, ki0, kd0,
+            integral: 0.0,
+            last_error: 0.0,
+        }
+    }
+
+    fn trimf(x: f32, a: f32, b: f32, c: f32) -> f32 {
+        if x <= a || x >= c {
+            0.0
+        } else if x <= b {
+            (x - a) / (b - a)
+        } else {
+            (c - x) / (c - b)
+        }
+    }
+
+    fn compute(&mut self, setpoint: f32, current: f32, dt_s: f32) -> i16 {
+        let e = current - setpoint; 
+        let ec = if dt_s > 0.0 { (e - self.last_error) / dt_s } else { 0.0 };
+
+        let e_norm = f32_clamp(e / 10.0, -1.0, 1.0);
+        let ec_norm = f32_clamp(ec / 5.0, -1.0, 1.0);
+
+        let mf_nb = |x: f32| Self::trimf(x, -2.0, -1.0, -0.5);
+        let mf_ns = |x: f32| Self::trimf(x, -1.0, -0.5, 0.0);
+        let mf_z  = |x: f32| Self::trimf(x, -0.5, 0.0, 0.5);
+        let mf_ps = |x: f32| Self::trimf(x, 0.0, 0.5, 1.0);
+        let mf_pb = |x: f32| Self::trimf(x, 0.5, 1.0, 2.0);
+
+        let e_mfs = [mf_nb(e_norm), mf_ns(e_norm), mf_z(e_norm), mf_ps(e_norm), mf_pb(e_norm)];
+        let ec_mfs = [mf_nb(ec_norm), mf_ns(ec_norm), mf_z(ec_norm), mf_ps(ec_norm), mf_pb(ec_norm)];
+
+        let rules_kp = [
+            [ 1.0,  1.0,  1.0,  0.5,  0.0],
+            [ 1.0,  0.5,  0.5,  0.0, -0.5],
+            [ 0.5,  0.0,  0.0,  0.0, -0.5],
+            [-0.5,  0.0,  0.5,  0.5,  1.0],
+            [ 0.0,  0.5,  1.0,  1.0,  1.0],
+        ];
+        
+        let rules_ki = [
+            [-1.0, -0.5,  0.0, -0.5, -1.0],
+            [-0.5,  0.0,  0.5,  0.0, -0.5],
+            [ 0.0,  0.5,  1.0,  0.5,  0.0],
+            [-0.5,  0.0,  0.5,  0.0, -0.5],
+            [-1.0, -0.5,  0.0, -0.5, -1.0],
+        ];
+
+        let rules_kd = [
+            [ 1.0,  0.5,  0.0,  0.5,  1.0],
+            [ 0.5,  0.0, -0.5,  0.0,  0.5],
+            [ 0.0, -0.5, -1.0, -0.5,  0.0],
+            [ 0.5,  0.0, -0.5,  0.0,  0.5],
+            [ 1.0,  0.5,  0.0,  0.5,  1.0],
+        ];
+
+        let mut num_kp = 0.0;
+        let mut num_ki = 0.0;
+        let mut num_kd = 0.0;
+        let mut den = 0.0;
+
+        for i in 0..5 {
+            for j in 0..5 {
+                let weight = f32_min(e_mfs[i], ec_mfs[j]);
+                den += weight;
+                num_kp += weight * rules_kp[i][j];
+                num_ki += weight * rules_ki[i][j];
+                num_kd += weight * rules_kd[i][j];
+            }
+        }
+
+        let (mut dkp, mut dki, mut dkd) = (0.0, 0.0, 0.0);
+        if den > 0.0 {
+            dkp = num_kp / den;
+            dki = num_ki / den;
+            dkd = num_kd / den;
+        }
+
+        let kp = f32_max(self.kp0 + dkp * 5.0, 0.0);
+        let ki = f32_max(self.ki0 + dki * 0.5, 0.0);
+        let kd = f32_max(self.kd0 + dkd * 1.0, 0.0);
+
+        self.integral += e * dt_s;
+        self.integral = f32_clamp(self.integral, -50.0, 50.0);
+
+        let output = kp * e + ki * self.integral + kd * ec;
+        self.last_error = e;
+
+        f32_clamp(output * 10.0, -100.0, 100.0) as i16
+    }
+}
+
 #[bsp::rt::entry]
 fn main() -> ! {
     let board::Resources {
@@ -490,16 +674,17 @@ fn main() -> ! {
     cortex_m::peripheral::NVIC::pend(interrupt::USB_OTG1);
     unsafe { cortex_m::peripheral::NVIC::unmask(interrupt::USB_OTG1) };
 
-    // Tunggu device selesai enumerasi (sepenuhnya diservis oleh interrupt,
-    // bukan polling manual di sini) - timeout kasar supaya board tetap
-    // bisa boot standalone kalau tidak ada host yang connect.
+    // Tunggu device selesai enumerasi
     for _ in 0..3_000_000u32 {
         if with_usb_comm(|comm| comm.configured).unwrap_or(false) {
             break;
         }
     }
 
-    delay.block_ms(500);
+    for _ in 0..500 {
+        delay.block_ms(1);
+        with_usb_comm(|comm| comm.poll());
+    }
 
     // ===================================================
     // GPIO INITIALIZATION
@@ -682,17 +867,33 @@ fn main() -> ! {
     // wiring Peltier ke OUT1/OUT2 BTS7960 diganti, cukup tukar lagi tanda
     // kedua konstanta power di bawah, tidak perlu ubah logika suhunya.
     // ===================================================
-    const PELTIER_HYSTERESIS_C: f32 = 0.5;
-    const PELTIER_COOL_POWER_PERCENT: i16 = 100;
-    const PELTIER_HEAT_POWER_PERCENT: i16 = 100;
     let mut setpoint_c: f32 = 25.0;
+    #[allow(unused_assignments)]
     let mut peltier_mode: &str = "OFF";
+    let mut fuzzy_pid = FuzzyPid::new(5.0, 0.5, 1.0);
 
     let mut phase_mode: &str = "OFF";
     let mut pump1_pwm_val: u16 = 500; // default 50%
 
     let mut setpoint_rx_buf = [0u8; 48];
     let mut setpoint_rx_len: usize = 0;
+    
+    let mut manual_pwr_mode: bool = false;
+    let mut manual_pwr_val: i16 = 0;
+
+    macro_rules! my_usb_delay_ms {
+        ($delay_ms:expr) => {{
+            for _ in 0..$delay_ms {
+                delay.block_ms(1);
+                process_usb_commands!(
+                    &mut setpoint_rx_buf, &mut setpoint_rx_len,
+                    setpoint_c, phase_mode, pump1_pwm_val,
+                    manual_pwr_mode, manual_pwr_val,
+                    set_pump1_pwm, p41, p39, p40, p14, p38
+                );
+            }
+        }};
+    }
 
     // ===================================================
     // NDIR state machine + filters (IR12EM hydrocarbon sensor)
@@ -809,38 +1010,40 @@ fn main() -> ! {
         // Mode continuous shunt+bus, averaging 1x, conversion time 1.1ms (nilai default POR)
         ina226_write(&mut ina226_i2c, addr, INA226_REG_CONFIG, 0x4127);
         ina226_write(&mut ina226_i2c, addr, INA226_REG_CALIB, INA226_CAL_VALUE);
-        delay.block_ms(2);
+        my_usb_delay_ms!(2);
         ina226_ok[i] = ina226_read(&mut ina226_i2c, addr, INA226_REG_CALIB) == INA226_CAL_VALUE;
     }
 
-    let mut select_pca = |channel: u8, delay: &mut Blocking<_, { board::PERCLK_FREQUENCY }>| {
-        let _ = pca_i2c.write(PCA_ADDR, &[1 << channel]);
-        delay.block_ms(5);
-    };
+    macro_rules! select_pca {
+        ($channel:expr) => {
+            let _ = pca_i2c.write(PCA_ADDR, &[1 << $channel]);
+            my_usb_delay_ms!(5);
+        };
+    }
 
     let mut adc = Ads1x1x::new_ads1115(adc_i2c, SlaveAddr::default());
     let mut ads_ok = [false; 4];
 
     // ADS0
-    select_pca(0, &mut delay);
+    select_pca!(0);
     if adc.set_full_scale_range(FullScaleRange::Within4_096V).is_ok() {
         ads_ok[0] = true;
     }
 
     // ADS1
-    select_pca(1, &mut delay);
+    select_pca!(1);
     if adc.set_full_scale_range(FullScaleRange::Within4_096V).is_ok() {
         ads_ok[1] = true;
     }
 
     // ADS2
-    select_pca(2, &mut delay);
+    select_pca!(2);
     if adc.set_full_scale_range(FullScaleRange::Within4_096V).is_ok() {
         ads_ok[2] = true;
     }
 
     // ADS3
-    select_pca(3, &mut delay);
+    select_pca!(3);
     if adc.set_full_scale_range(FullScaleRange::Within4_096V).is_ok() {
         ads_ok[3] = true;
     }
@@ -876,73 +1079,8 @@ fn main() -> ! {
     };
 
     loop {
-        for _gpio_idx in 0..6 {
-            if let Some(cmd) =
-                with_usb_comm(|comm| comm.poll_cmd(&mut setpoint_rx_buf, &mut setpoint_rx_len))
-                    .flatten()
-            {
-                match cmd {
-                    HostCmd::Setpoint(val) => {
-                        setpoint_c = val;
-                        usb_println!("ACK SETPOINT = {:.2} C", setpoint_c);
-                    },
-                    HostCmd::Phase(p) => {
-                        phase_mode = p;
-                        usb_println!("ACK PHASE = {}", p);
-                    },
-                    HostCmd::Pump1Pwm(val) => {
-                        let val_permille = (val.min(100) as u16) * 10;
-                        pump1_pwm_val = val_permille;
-                        usb_println!("ACK PWM = {}%", val.min(100));
-                        if phase_mode == "INJECT" {
-                            set_pump1_pwm(pump1_pwm_val);
-                        }
-                    }
-                }
-            }
-            
-            // Handle Phases
-            match phase_mode {
-                "IDLE" => {
-                    let _ = p41.set_high(); // Pump 3
-                    let _ = p39.set_high(); // SV2
-                    let _ = p40.set_high(); // SV3
-                    
-                    let _ = p14.set_low(); // Pump 2
-                    let _ = p38.set_low(); // SV1
-                    set_pump1_pwm(0);
-                },
-                "INJECT" => {
-                    set_pump1_pwm(pump1_pwm_val); // Pump 1
-                    let _ = p38.set_high(); // SV1
-                    
-                    let _ = p14.set_low(); // Pump 2
-                    let _ = p41.set_low(); // Pump 3
-                    let _ = p40.set_low(); // SV3
-                    let _ = p39.set_low(); // SV2
-                },
-                "PURGE" => {
-                    let _ = p41.set_high(); // Pump 3
-                    let _ = p39.set_high(); // SV2
-                    let _ = p40.set_high(); // SV3
-                    
-                    let _ = p38.set_low(); // SV1
-                    let _ = p14.set_low(); // Pump 2
-                    set_pump1_pwm(0);
-                },
-                _ => { // OFF
-                    let _ = p14.set_low();
-                    let _ = p38.set_low();
-                    let _ = p39.set_low();
-                    let _ = p40.set_low();
-                    let _ = p41.set_low();
-                    set_pump1_pwm(0);
-                }
-            }
-
-            // ===================================================
-            // NDIR CYCLE — one ON/OFF pair per loop iteration
-            // Lamp ON → 125 ms → read ACT/REF → lamp OFF → 125 ms → read ACT/REF → process
+        // NDIR CYCLE — one ON/OFF pair per loop iteration
+        // Lamp ON → 125 ms → read ACT/REF → lamp OFF → 125 ms → read ACT/REF → process
             // Results stored in ndir_* vars, output with other sensors below.
             // ===================================================
             let mut _ndir_ratio:      f32 = 0.0;
@@ -962,9 +1100,9 @@ fn main() -> ! {
                 for _ in 0..4 {
                     // ── ON phase ──────────────────────────────────────
                     let _ = ir_lamp.set_high();
-                    delay.block_ms(NDIR_HALF_PERIOD_MS);
+                    my_usb_delay_ms!(NDIR_HALF_PERIOD_MS);
 
-                    select_pca(3, &mut delay);
+                    select_pca!(3);
                     let ndir_act_on_raw = read_ads_raw(ChannelSelection::SingleA1).max(0) as u16;
                     let ndir_ref_on_raw = read_ads_raw(ChannelSelection::SingleA2).max(0) as u16;
 
@@ -979,9 +1117,9 @@ fn main() -> ! {
 
                     // ── OFF phase ─────────────────────────────────────
                     let _ = ir_lamp.set_low();
-                    delay.block_ms(NDIR_HALF_PERIOD_MS);
+                    my_usb_delay_ms!(NDIR_HALF_PERIOD_MS);
 
-                    select_pca(3, &mut delay);
+                    select_pca!(3);
                     let ndir_act_off_raw = read_ads_raw(ChannelSelection::SingleA1).max(0) as u16;
                     let ndir_ref_off_raw = read_ads_raw(ChannelSelection::SingleA2).max(0) as u16;
 
@@ -1009,7 +1147,7 @@ fn main() -> ! {
                 }
             } else {
                 // If NDIR sensor is offline, simulate the 1-second delay so the loop cadence is intact
-                delay.block_ms(1000);
+                my_usb_delay_ms!(1000);
             }
 
             // SENSOR VARIABLES (Raw i16)
@@ -1035,7 +1173,7 @@ fn main() -> ! {
 
             // ADS0
             if ads_ok[0] {
-                select_pca(0, &mut delay);
+                select_pca!(0);
                 mq2 = mox_filters[0].update_i16(read_ads_raw(ChannelSelection::SingleA0));
                 mq3 = mox_filters[1].update_i16(read_ads_raw(ChannelSelection::SingleA1));
                 mq4 = mox_filters[2].update_i16(read_ads_raw(ChannelSelection::SingleA2));
@@ -1044,7 +1182,7 @@ fn main() -> ! {
 
             // ADS1
             if ads_ok[1] {
-                select_pca(1, &mut delay);
+                select_pca!(1);
                 mq6   = mox_filters[4].update_i16(read_ads_raw(ChannelSelection::SingleA0));
                 mq7   = mox_filters[5].update_i16(read_ads_raw(ChannelSelection::SingleA1));
                 mq8   = mox_filters[6].update_i16(read_ads_raw(ChannelSelection::SingleA2));
@@ -1053,7 +1191,7 @@ fn main() -> ! {
 
             // ADS2
             if ads_ok[2] {
-                select_pca(2, &mut delay);
+                select_pca!(2);
                 tgs2600 = mox_filters[8].update_i16(read_ads_raw(ChannelSelection::SingleA0));
                 tgs2611 = mox_filters[9].update_i16(read_ads_raw(ChannelSelection::SingleA1));
                 tgs2610 = mox_filters[10].update_i16(read_ads_raw(ChannelSelection::SingleA2));
@@ -1062,7 +1200,7 @@ fn main() -> ! {
 
             // ADS3
             if ads_ok[3] {
-                select_pca(3, &mut delay);
+                select_pca!(3);
                 tgs813    = mox_filters[12].update_i16(read_ads_raw(ChannelSelection::SingleA0));
                 ir12emact = read_ads_raw(ChannelSelection::SingleA1);
                 ir12emref = read_ads_raw(ChannelSelection::SingleA2);
@@ -1101,13 +1239,13 @@ fn main() -> ! {
 
             // Non-aktifkan semua channel PCA agar tidak ada interferensi di bus utama
             let _ = sht_i2c.write(0x70, &[0x00]);
-            delay.block_ms(5);
+            my_usb_delay_ms!(5);
 
             // Single shot, high repeatability, clock stretching enabled (same command as the
             // known-working Arduino reference: 0x2C06)
             match sht_i2c.write(0x44, &[0x2C, 0x06]) {
                 Ok(_) => {
-                    delay.block_ms(20);
+                    my_usb_delay_ms!(20);
                     let mut buf = [0u8; 6];
                     match embedded_hal::blocking::i2c::Read::read(&mut sht_i2c, 0x44, &mut buf) {
                         Ok(_) => {
@@ -1125,14 +1263,23 @@ fn main() -> ! {
             usb_println!("SHT30 Temp  = {:.2} C", sht30_temp);
             usb_println!("SHT30 Humi  = {:.2} %RH", sht30_hum);
 
-            // KONTROL PELTIER - berbasis suhu chamber (SHT30 di atas), lihat
-            // penjelasan bang-bang + hysteresis di dekat inisialisasi Peltier.
-            if sht30_temp > setpoint_c + PELTIER_HYSTERESIS_C {
-                set_peltier_power(PELTIER_COOL_POWER_PERCENT);
-                peltier_mode = "COOL";
-            } else if sht30_temp < setpoint_c - PELTIER_HYSTERESIS_C {
-                set_peltier_power(-PELTIER_HEAT_POWER_PERCENT);
-                peltier_mode = "HEAT";
+            // KONTROL PELTIER - menggunakan Fuzzy PID
+            if manual_pwr_mode {
+                set_peltier_power(manual_pwr_val);
+                peltier_mode = "MANUAL";
+            } else if setpoint_c > 0.0 {
+                let pwr = fuzzy_pid.compute(setpoint_c, sht30_temp, 1.0);
+                set_peltier_power(pwr);
+                if pwr > 0 {
+                    peltier_mode = "COOL";
+                } else if pwr < 0 {
+                    peltier_mode = "HEAT";
+                } else {
+                    peltier_mode = "IDLE";
+                }
+            } else {
+                set_peltier_power(0);
+                peltier_mode = "OFF";
             }
 
             // SHT31 read (bus i2c1, pin 16/17)
@@ -1142,7 +1289,7 @@ fn main() -> ! {
 
             match sht31_i2c.write(SHT31_ADDR, &[0x2C, 0x06]) {
                 Ok(_) => {
-                    delay.block_ms(20);
+                    my_usb_delay_ms!(20);
                     let mut buf = [0u8; 6];
                     match embedded_hal::blocking::i2c::Read::read(&mut sht31_i2c, SHT31_ADDR, &mut buf) {
                         Ok(_) => {
@@ -1203,6 +1350,6 @@ fn main() -> ! {
                     power
                 );
             }
-        }
     }
 }
+

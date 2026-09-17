@@ -32,6 +32,7 @@ NUMERIC_FIELDS = ADC_SENSOR_NAMES + [
     "temp_sample", "hum_sample",
     "ina_actuator_v", "ina_actuator_i", "ina_actuator_p",
     "ina_sensor_mcu_v", "ina_sensor_mcu_i", "ina_sensor_mcu_p",
+    "kria_v", "kria_i", "kria_p",
     "setpoint_c",
 ]
 
@@ -100,6 +101,13 @@ class SensorPersistence:
             """
         )
         self._db.commit()
+        # Add new columns if the table already existed before this update
+        for col in ["kria_v", "kria_i", "kria_p"]:
+            try:
+                self._db.execute(f"ALTER TABLE sensor_readings ADD COLUMN {col} REAL")
+            except sqlite3.OperationalError:
+                pass
+        self._db.commit()
 
     def process_line(self, line):
         sample = self._current
@@ -166,8 +174,32 @@ class SensorPersistence:
         self._current = dict(sample)
 
     def _write(self, sample, ts_unix):
+        self._read_kria_power(sample)
         self._write_sqlite(sample, ts_unix)
         self._write_influx(sample, ts_unix)
+
+    def _read_kria_power(self, sample):
+        try:
+            import glob
+            import os
+            base = None
+            for d in glob.glob("/sys/class/hwmon/hwmon*"):
+                try:
+                    with open(os.path.join(d, "name"), "r") as f:
+                        if "ina260" in f.read():
+                            base = d
+                            break
+                except:
+                    pass
+            if base:
+                with open(os.path.join(base, "in1_input"), "r") as f:
+                    sample["kria_v"] = float(f.read().strip()) / 1000.0
+                with open(os.path.join(base, "curr1_input"), "r") as f:
+                    sample["kria_i"] = float(f.read().strip())
+                with open(os.path.join(base, "power1_input"), "r") as f:
+                    sample["kria_p"] = float(f.read().strip()) / 1e6
+        except Exception as e:
+            pass
 
     def _write_sqlite(self, sample, ts_unix):
         try:

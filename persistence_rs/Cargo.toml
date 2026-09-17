@@ -1,0 +1,12 @@
+[package]
+name = "persistence_rs"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+regex = "1.10"
+dotenvy = "0.15"
+chrono = "0.4"
+lazy_static = "1.4"

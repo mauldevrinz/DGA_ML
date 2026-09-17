@@ -1,0 +1,5 @@
+numpy
+websockets
+pyusb
+requests
+matplotlib
