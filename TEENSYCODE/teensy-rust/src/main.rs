@@ -985,6 +985,9 @@ fn main() -> ! {
     // batas saturasi tegangan shunt R005 sendiri (+-81.92 mV / 0.005 ohm =
     // +-16.38 A), jadi keduanya sudah sinkron.
     const INA226_CURRENT_LSB: f32 = 0.0005; // 500 uA / bit
+    // Offset INA226 #2 (0x40), hasil Percobaan 1: rata-rata (sensor - multimeter) = 401.143 mA.
+    // INA226 #1 (0x41) belum dikalibrasi pada percobaan ini.
+    const INA226_CURRENT_OFFSET_A: [f32; 2] = [0.0, 0.401_143];
     const INA226_POWER_LSB: f32 = INA226_CURRENT_LSB * 25.0;
     const INA226_CAL_VALUE: u16 = 2048;
     const INA226_BUS_LSB: f32 = 0.00125; // 1.25 mV / bit (tetap, sesuai datasheet)
@@ -1338,7 +1341,8 @@ fn main() -> ! {
 
                 let bus_voltage = bus_raw as f32 * INA226_BUS_LSB;
                 let shunt_voltage = shunt_raw as f32 * INA226_SHUNT_LSB;
-                let current = current_raw as f32 * INA226_CURRENT_LSB;
+                let current_uncalibrated = current_raw as f32 * INA226_CURRENT_LSB;
+                let current = current_uncalibrated - INA226_CURRENT_OFFSET_A[i];
                 let power = power_raw as f32 * INA226_POWER_LSB;
 
                 usb_println!(
