@@ -987,30 +987,25 @@ fn main() -> ! {
     const INA226_CURRENT_LSB: f32 = 0.0005; // 500 uA / bit
 
     // ---------------------------------------------------------------
-    // KALIBRASI 2-TITIK (gain + offset), hasil regresi linear dari
-    // Percobaan 2 (Idle/Purging/Inject PWM 20-100%) vs pembacaan avometer.
-    // Data ini dari INA226 #1 (index 0, addr 0x41) = sensor arus AKTUATOR:
+    // KALIBRASI 2-TITIK (gain + offset), hasil regresi linear.
     //
-    //   Idle          : sensor 2218 mA, avo 1713 mA
-    //   Purging       : sensor 2283 mA, avo 1690 mA
-    //   Inject PWM 20%: sensor 1391 mA, avo 1022 mA
-    //   Inject PWM 40%: sensor 1360 mA, avo  994 mA
-    //   Inject PWM 60%: sensor 1297 mA, avo  993 mA
-    //   Inject PWM 80%: sensor 1317 mA, avo  997 mA
-    //   Inject PWM100%: sensor 1341 mA, avo  990 mA
-    //
-    // Regresi: current_uncalibrated ≈ 1.2938 * arus_asli + 0.4498 (A)
-    // Dibalik: arus_asli ≈ 0.773 * current_uncalibrated - 0.3477 (A)
-    //
+    // INA226 #1 (index 0, addr 0x41) = sensor arus AKTUATOR.
+    // Regresi terbaru (Percobaan 3, menggantikan Percobaan 2 karena
+    // titik ukur multimeter berubah sedikit dari sesi sebelumnya):
+    //   Idle          : raw ~2225 mA, multimeter 1672 mA
+    //   Purging       : raw ~2237 mA, multimeter 1657 mA
+    //   Inject PWM 20%: raw ~1301 mA, multimeter  985 mA
+    //   Inject PWM 40%: raw ~1352 mA, multimeter  986 mA
+    // Regresi: raw ≈ 1.3312 * arus_asli + 0.01476 (A)
+    // Dibalik: arus_asli ≈ 0.7511 * raw - 0.0111 (A)
     // current_terkoreksi = current_uncalibrated * GAIN + OFFSET_A
     //
-    // INA226 #2 (index 1, addr 0x40, sensor+MCU) memakai kalibrasi lama
-    // dari Percobaan 1: offset-only, rata-rata (sensor - multimeter) =
-    // 401.143 mA -> current_terkoreksi = current_uncalibrated - 0.401143,
-    // ditulis di sini sebagai gain=1, offset=-0.401143.
+    // INA226 #2 (index 1, addr 0x40, sensor+MCU): TIDAK dikalibrasi
+    // (gain=1, offset=0) sesuai permintaan - offset lama -401.143 mA
+    // dari Percobaan 1 dihapus.
     // ---------------------------------------------------------------
-    const INA226_CURRENT_GAIN:     [f32; 2] = [0.773,    1.0];
-    const INA226_CURRENT_OFFSET_A: [f32; 2] = [-0.3477, -0.401_143];
+    const INA226_CURRENT_GAIN:     [f32; 2] = [0.7511,  1.0];
+    const INA226_CURRENT_OFFSET_A: [f32; 2] = [-0.0111, 0.0];
 
     const INA226_POWER_LSB: f32 = INA226_CURRENT_LSB * 25.0;
     const INA226_CAL_VALUE: u16 = 2048;
