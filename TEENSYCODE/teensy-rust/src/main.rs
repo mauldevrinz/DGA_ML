@@ -988,7 +988,8 @@ fn main() -> ! {
 
     // ---------------------------------------------------------------
     // KALIBRASI 2-TITIK (gain + offset), hasil regresi linear dari
-    // Percobaan 2 (Idle/Purging/Inject PWM 20-100%) vs pembacaan avometer:
+    // Percobaan 2 (Idle/Purging/Inject PWM 20-100%) vs pembacaan avometer.
+    // Data ini dari INA226 #1 (index 0, addr 0x41) = sensor arus AKTUATOR:
     //
     //   Idle          : sensor 2218 mA, avo 1713 mA
     //   Purging       : sensor 2283 mA, avo 1690 mA
@@ -1003,12 +1004,13 @@ fn main() -> ! {
     //
     // current_terkoreksi = current_uncalibrated * GAIN + OFFSET_A
     //
-    // INA226 #1 (0x41, arus aktuator) BELUM dikalibrasi pada percobaan
-    // ini - masih gain=1, offset=0. Ulangi prosedur yang sama (beberapa
-    // titik arus vs avometer, regresi linear) begitu datanya tersedia.
+    // INA226 #2 (index 1, addr 0x40, sensor+MCU) memakai kalibrasi lama
+    // dari Percobaan 1: offset-only, rata-rata (sensor - multimeter) =
+    // 401.143 mA -> current_terkoreksi = current_uncalibrated - 0.401143,
+    // ditulis di sini sebagai gain=1, offset=-0.401143.
     // ---------------------------------------------------------------
-    const INA226_CURRENT_GAIN:     [f32; 2] = [1.0,     0.773];
-    const INA226_CURRENT_OFFSET_A: [f32; 2] = [0.0,   -0.3477];
+    const INA226_CURRENT_GAIN:     [f32; 2] = [0.773,    1.0];
+    const INA226_CURRENT_OFFSET_A: [f32; 2] = [-0.3477, -0.401_143];
 
     const INA226_POWER_LSB: f32 = INA226_CURRENT_LSB * 25.0;
     const INA226_CAL_VALUE: u16 = 2048;
