@@ -190,7 +190,7 @@ macro_rules! process_usb_commands {
                 HostCmd::Phase(p) => {
                     $phase = p;
                     usb_println!("ACK PHASE = {}", p);
-                    
+
                     // Handle Phases immediately
                     match $phase {
                         "IDLE" => {
@@ -533,7 +533,7 @@ impl FuzzyPid {
     }
 
     fn compute(&mut self, setpoint: f32, current: f32, dt_s: f32) -> i16 {
-        let e = current - setpoint; 
+        let e = current - setpoint;
         let ec = if dt_s > 0.0 { (e - self.last_error) / dt_s } else { 0.0 };
 
         let e_norm = f32_clamp(e / 10.0, -1.0, 1.0);
@@ -555,7 +555,7 @@ impl FuzzyPid {
             [-0.5,  0.0,  0.5,  0.5,  1.0],
             [ 0.0,  0.5,  1.0,  1.0,  1.0],
         ];
-        
+
         let rules_ki = [
             [-1.0, -0.5,  0.0, -0.5, -1.0],
             [-0.5,  0.0,  0.5,  0.0, -0.5],
@@ -723,7 +723,7 @@ fn main() -> ! {
 
     let mut pump1_r_en = gpio4.output(pins.p4);
     let _ = pump1_r_en.set_low(); // Disabled at boot
-    
+
     let (mut pwm4, (_pwm4_sm0, _pwm4_sm1, mut pwm4_sm2, _pwm4_sm3)) = flexpwm4;
     pwm4_sm2.set_clock_select(flexpwm::ClockSelect::Ipg);
     pwm4_sm2.set_prescaler(flexpwm::Prescaler::Prescaler1);
@@ -732,12 +732,12 @@ fn main() -> ! {
     pwm4_sm2.set_load_frequency(1);
     pwm4_sm2.set_initial_count(&pwm4, i16::MIN);
     pwm4_sm2.set_value(flexpwm::FULL_RELOAD_VALUE_REGISTER, i16::MAX);
-    
+
     let pump1_lpwm_out = flexpwm::Output::new_b(pins.p3);
     let pump1_rpwm_out = flexpwm::Output::new_a(pins.p2);
     pump1_lpwm_out.set_turn_on(&pwm4_sm2, i16::MIN);
     pump1_rpwm_out.set_turn_on(&pwm4_sm2, i16::MIN);
-    
+
     pwm4_sm2.set_load_ok(&mut pwm4);
     pwm4_sm2.set_running(&mut pwm4, true);
 
@@ -756,7 +756,7 @@ fn main() -> ! {
             pump1_lpwm_out.set_output_enable(&mut pwm4, true);
         }
     };
-    
+
     set_pump1_pwm(0);
 
     // ===================================================
@@ -877,7 +877,7 @@ fn main() -> ! {
 
     let mut setpoint_rx_buf = [0u8; 48];
     let mut setpoint_rx_len: usize = 0;
-    
+
     let mut manual_pwr_mode: bool = false;
     let mut manual_pwr_val: i16 = 0;
 
@@ -902,7 +902,7 @@ fn main() -> ! {
     let mut ndir_act_cf = NdirChannelFilter::new(NDIR_RAW_EMA_ALPHA);
     let mut ndir_ref_cf = NdirChannelFilter::new(NDIR_RAW_EMA_ALPHA);
     let mut ndir_proc_filt = NdirProcessedFilter::new(NDIR_PROC_EMA_ALPHA);
-    
+
     // ===================================================
     // EMA Filters for MOX Sensors (MQ & TGS series)
     // ===================================================
@@ -985,9 +985,31 @@ fn main() -> ! {
     // batas saturasi tegangan shunt R005 sendiri (+-81.92 mV / 0.005 ohm =
     // +-16.38 A), jadi keduanya sudah sinkron.
     const INA226_CURRENT_LSB: f32 = 0.0005; // 500 uA / bit
-    // Offset INA226 #2 (0x40), hasil Percobaan 1: rata-rata (sensor - multimeter) = 401.143 mA.
-    // INA226 #1 (0x41) belum dikalibrasi pada percobaan ini.
-    const INA226_CURRENT_OFFSET_A: [f32; 2] = [0.0, 0.401_143];
+
+    // ---------------------------------------------------------------
+    // KALIBRASI 2-TITIK (gain + offset), hasil regresi linear dari
+    // Percobaan 2 (Idle/Purging/Inject PWM 20-100%) vs pembacaan avometer:
+    //
+    //   Idle          : sensor 2218 mA, avo 1713 mA
+    //   Purging       : sensor 2283 mA, avo 1690 mA
+    //   Inject PWM 20%: sensor 1391 mA, avo 1022 mA
+    //   Inject PWM 40%: sensor 1360 mA, avo  994 mA
+    //   Inject PWM 60%: sensor 1297 mA, avo  993 mA
+    //   Inject PWM 80%: sensor 1317 mA, avo  997 mA
+    //   Inject PWM100%: sensor 1341 mA, avo  990 mA
+    //
+    // Regresi: current_uncalibrated ≈ 1.2938 * arus_asli + 0.4498 (A)
+    // Dibalik: arus_asli ≈ 0.773 * current_uncalibrated - 0.3477 (A)
+    //
+    // current_terkoreksi = current_uncalibrated * GAIN + OFFSET_A
+    //
+    // INA226 #1 (0x41, arus aktuator) BELUM dikalibrasi pada percobaan
+    // ini - masih gain=1, offset=0. Ulangi prosedur yang sama (beberapa
+    // titik arus vs avometer, regresi linear) begitu datanya tersedia.
+    // ---------------------------------------------------------------
+    const INA226_CURRENT_GAIN:     [f32; 2] = [1.0,     0.773];
+    const INA226_CURRENT_OFFSET_A: [f32; 2] = [0.0,   -0.3477];
+
     const INA226_POWER_LSB: f32 = INA226_CURRENT_LSB * 25.0;
     const INA226_CAL_VALUE: u16 = 2048;
     const INA226_BUS_LSB: f32 = 0.00125; // 1.25 mV / bit (tetap, sesuai datasheet)
@@ -1319,7 +1341,7 @@ fn main() -> ! {
             } else {
                 let _ = p15.set_high(); // Fan ON
             }
-            
+
             usb_println!("SETPOINT = {:.2} C", setpoint_c);
             usb_println!("PELTIER_MODE = {}", peltier_mode);
 
@@ -1342,7 +1364,9 @@ fn main() -> ! {
                 let bus_voltage = bus_raw as f32 * INA226_BUS_LSB;
                 let shunt_voltage = shunt_raw as f32 * INA226_SHUNT_LSB;
                 let current_uncalibrated = current_raw as f32 * INA226_CURRENT_LSB;
-                let current = current_uncalibrated - INA226_CURRENT_OFFSET_A[i];
+                // Kalibrasi 2-titik: gain dulu, baru offset ditambahkan
+                // (lihat catatan di deklarasi INA226_CURRENT_GAIN/OFFSET_A di atas).
+                let current = current_uncalibrated * INA226_CURRENT_GAIN[i] + INA226_CURRENT_OFFSET_A[i];
                 let power = power_raw as f32 * INA226_POWER_LSB;
 
                 usb_println!(
@@ -1356,4 +1380,3 @@ fn main() -> ! {
             }
     }
 }
-
