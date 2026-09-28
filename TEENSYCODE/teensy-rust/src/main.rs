@@ -533,7 +533,14 @@ impl FuzzyPid {
     }
 
     fn compute(&mut self, setpoint: f32, current: f32, dt_s: f32) -> i16 {
-        let e = current - setpoint;
+        let mut e = current - setpoint;
+        
+        // Deadband filter: Abaikan fluktuasi error sangat kecil (±0.05°C) 
+        // untuk mencegah osilasi/hunting di sekitar setpoint.
+        if e.abs() < 0.05 {
+            e = 0.0;
+        }
+        
         let ec = if dt_s > 0.0 { (e - self.last_error) / dt_s } else { 0.0 };
 
         let e_norm = f32_clamp(e / 10.0, -1.0, 1.0);
@@ -598,10 +605,26 @@ impl FuzzyPid {
         let ki = f32_max(self.ki0 + dki * 0.5, 0.0);
         let kd = f32_max(self.kd0 + dkd * 1.0, 0.0);
 
-        self.integral += e * dt_s;
-        self.integral = f32_clamp(self.integral, -50.0, 50.0);
+        let p_term = kp * e;
+        let d_term = kd * ec;
+        
+        // Anti-windup (Conditional Integration):
+        // Hanya tambahkan integral jika tidak memperparah saturasi output.
+        let trial_integral = self.integral + (e * dt_s);
+        let trial_output = (p_term + ki * trial_integral + d_term) * 10.0;
+        
+        if trial_output > 100.0 && e > 0.0 {
+            // Saturated cooling, don't wind up positively
+        } else if trial_output < -100.0 && e < 0.0 {
+            // Saturated heating, don't wind up negatively
+        } else {
+            self.integral = trial_integral;
+        }
 
-        let output = kp * e + ki * self.integral + kd * ec;
+        // Limit absolut integral untuk safety (range dikurangi agar tidak kebablasan)
+        self.integral = f32_clamp(self.integral, -20.0, 20.0);
+
+        let output = p_term + ki * self.integral + d_term;
         self.last_error = e;
 
         f32_clamp(output * 10.0, -100.0, 100.0) as i16
@@ -970,7 +993,6 @@ fn main() -> ! {
     const INA226_REG_CONFIG: u8 = 0x00;
     const INA226_REG_SHUNT: u8 = 0x01;
     const INA226_REG_BUS: u8 = 0x02;
-    const INA226_REG_POWER: u8 = 0x03;
     const INA226_REG_CURRENT: u8 = 0x04;
     const INA226_REG_CALIB: u8 = 0x05;
 
@@ -1000,14 +1022,15 @@ fn main() -> ! {
     // Dibalik: arus_asli ≈ 0.7511 * raw - 0.0111 (A)
     // current_terkoreksi = current_uncalibrated * GAIN + OFFSET_A
     //
-    // INA226 #2 (index 1, addr 0x40, sensor+MCU): TIDAK dikalibrasi
-    // (gain=1, offset=0) sesuai permintaan - offset lama -401.143 mA
-    // dari Percobaan 1 dihapus.
+    // INA226 #2 (index 1, addr 0x40, sensor+MCU):
+    // Rata-rata sensor raw: 905.6 mA
+    // Rata-rata multimeter: 618.4 mA
+    // Arus aktual sangat stabil, jadi kita gunakan kalibrasi offset murni.
+    // Offset = 618.4 - 905.6 = -287.2 mA (-0.2872 A)
     // ---------------------------------------------------------------
     const INA226_CURRENT_GAIN:     [f32; 2] = [0.7511,  1.0];
-    const INA226_CURRENT_OFFSET_A: [f32; 2] = [-0.0111, 0.0];
+    const INA226_CURRENT_OFFSET_A: [f32; 2] = [-0.0111, -0.2872];
 
-    const INA226_POWER_LSB: f32 = INA226_CURRENT_LSB * 25.0;
     const INA226_CAL_VALUE: u16 = 2048;
     const INA226_BUS_LSB: f32 = 0.00125; // 1.25 mV / bit (tetap, sesuai datasheet)
     const INA226_SHUNT_LSB: f32 = 0.0000025; // 2.5 uV / bit (tetap, sesuai datasheet)
@@ -1071,6 +1094,64 @@ fn main() -> ! {
     }
 
     // ===================================================
+    // ADS1115 FLOW SENSOR (MPXV7002DP) — bus I2C1 (pin 16/17)
+    // Sensor diferensial tekanan MPXV7002DP:
+    //   - VIN = 5V, output 0.5V..4.5V untuk -2kPa..+2kPa
+    //   - Transfer function: Vout = Vs*(0.2*P + 0.5)
+    //     → P(kPa) = (Vout/Vs - 0.5) / 0.2
+    //   - ADS1115 alamat default 0x48, channel A0
+    //   - FSR ±4.096V supaya bisa baca 0..4.5V output sensor
+    //
+    // Konversi ke flow (L/min) menggunakan Bernoulli:
+    //   v = sqrt(2 * |dP| / rho_air)  [m/s]
+    //   Q = v * A_tube * 60000        [L/min]
+    //   rho_air ≈ 1.225 kg/m3
+    //   A_tube untuk ID=6mm = pi*(0.003)^2 ≈ 2.827e-5 m2
+    // ===================================================
+    let flow_adc_i2c = i2c1_bus.acquire_i2c();
+    let mut flow_adc = Ads1x1x::new_ads1115(flow_adc_i2c, SlaveAddr::default());
+    let flow_adc_ok = flow_adc.set_full_scale_range(FullScaleRange::Within4_096V).is_ok();
+
+    // EMA filter untuk menstabilkan pembacaan flow
+    let mut flow_ema = NdirEma::new(0.25);
+
+    // Konstanta Orifice Plate (D = 7mm, d = 1.5mm)
+    const FLOW_PIPE_D_M: f32 = 0.007; // 7 mm (Diameter pipa)
+    const FLOW_ORIFICE_D_M: f32 = 0.0015; // 1.5 mm (Diameter lubang orifice)
+    const FLOW_ORIFICE_BETA: f32 = FLOW_ORIFICE_D_M / FLOW_PIPE_D_M; // 0.2142857
+    const FLOW_ORIFICE_BETA4: f32 = FLOW_ORIFICE_BETA * FLOW_ORIFICE_BETA * FLOW_ORIFICE_BETA * FLOW_ORIFICE_BETA;
+    const FLOW_ORIFICE_A2: f32 = 3.14159265 * (FLOW_ORIFICE_D_M / 2.0) * (FLOW_ORIFICE_D_M / 2.0); // 1.767e-6 m^2
+    const FLOW_ORIFICE_CD: f32 = 0.62; // Koefisien discharge standar untuk orifice
+    const FLOW_RHO_AIR: f32 = 1.225; // kg/m3 at STP
+    const FLOW_VS: f32 = 5.0; // Tegangan suplai MPXV7002DP
+
+    // ===================================================
+    // Auto-Zero Calibration untuk Flow Sensor
+    // Sensor sering memiliki offset (tidak persis 2.5V saat 0 kPa)
+    // ===================================================
+    let mut flow_zero_voltage = 0.5 * FLOW_VS; // Default ideal 2.5V
+    if flow_adc_ok {
+        // Beri waktu sensor stabil dan lakukan dummy read
+        delay.block_ms(100);
+        let _ = nb::block!(flow_adc.read(ChannelSelection::SingleA0));
+        delay.block_ms(50);
+
+        let mut sum_raw = 0i32;
+        let mut samples = 0;
+        for _ in 0..32 {
+            if let Ok(raw) = nb::block!(flow_adc.read(ChannelSelection::SingleA0)) {
+                sum_raw += raw.max(0) as i32;
+                samples += 1;
+            }
+            delay.block_ms(5);
+        }
+        if samples > 0 {
+            let avg_raw = sum_raw as f32 / samples as f32;
+            flow_zero_voltage = avg_raw * (4.096 / 32768.0);
+        }
+    }
+
+    // ===================================================
     // SYSTEM STATUS
     // D31 = nyala selama sistem berjalan (heartbeat)
     // D32 = nyala kalau ada sensor ADS yang gagal init
@@ -1093,6 +1174,10 @@ fn main() -> ! {
             INA226_ADDR[i],
             if ina226_ok[i] { "OK" } else { "ERROR" }
         );
+    }
+    usb_println!("FLOW ADS1115 (addr 0x48): {}", if flow_adc_ok { "OK" } else { "ERROR" });
+    if flow_adc_ok {
+        usb_println!("FLOW ZERO OFFSET = {:.4} V", flow_zero_voltage);
     }
     usb_println!("");
 
@@ -1356,15 +1441,22 @@ fn main() -> ! {
                 let bus_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_BUS);
                 let shunt_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_SHUNT) as i16;
                 let current_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_CURRENT) as i16;
-                let power_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_POWER);
 
                 let bus_voltage = bus_raw as f32 * INA226_BUS_LSB;
                 let shunt_voltage = shunt_raw as f32 * INA226_SHUNT_LSB;
                 let current_uncalibrated = current_raw as f32 * INA226_CURRENT_LSB;
                 // Kalibrasi 2-titik: gain dulu, baru offset ditambahkan
                 // (lihat catatan di deklarasi INA226_CURRENT_GAIN/OFFSET_A di atas).
-                let current = current_uncalibrated * INA226_CURRENT_GAIN[i] + INA226_CURRENT_OFFSET_A[i];
-                let power = power_raw as f32 * INA226_POWER_LSB;
+                let mut current = current_uncalibrated * INA226_CURRENT_GAIN[i] + INA226_CURRENT_OFFSET_A[i];
+                
+                // Mencegah nilai minus akibat kalibrasi offset saat tidak ada arus
+                if current < 0.0 {
+                    current = 0.0;
+                }
+                
+                // Hitung power secara manual menggunakan arus yang sudah dikalibrasi
+                // karena power_raw dari IC belum memperhitungkan offset software ini
+                let power = current * bus_voltage;
 
                 usb_println!(
                     "INA226_{} Vbus = {:.3} V, Vshunt = {:.5} V, I = {:.4} A, P = {:.4} W",
@@ -1375,5 +1467,60 @@ fn main() -> ! {
                     power
                 );
             }
+
+            // ===================================================
+            // FLOW SENSOR — MPXV7002DP via ADS1115 (bus I2C1)
+            // Orifice Equation: Q = Cd * A2 * sqrt(2 * dP / (rho * (1 - beta^4)))
+            // ===================================================
+            let mut flow_lpm: f32 = 0.0;
+            if flow_adc_ok {
+                let flow_raw = nb::block!(flow_adc.read(ChannelSelection::SingleA0)).unwrap_or(0);
+                // ADS1115 FSR=±4.096V → LSB = 4.096/32768 = 0.000125 V/count
+                let flow_voltage = flow_raw.max(0) as f32 * (4.096 / 32768.0);
+
+                // MPXV7002DP transfer function: Vout = Vs*(0.2*P + 0.5)
+                // P(kPa) = (Vout - V_zero) / (0.2 * Vs)
+                let dp_kpa = (flow_voltage - flow_zero_voltage) / (0.2 * FLOW_VS);
+                let mut dp_pa = dp_kpa * 1000.0; // Convert kPa to Pa
+
+                // Deadband filter: Abaikan fluktuasi noise di bawah 3.0 Pa (sekitar ~1 L/min pada orifice ini)
+                if dp_pa < 3.0 && dp_pa > -3.0 {
+                    dp_pa = 0.0;
+                }
+
+                let abs_dp = if dp_pa < 0.0 { -dp_pa } else { dp_pa };
+                
+                // Orifice velocity term: sqrt(2 * dP / (rho * (1 - beta^4)))
+                let denominator = FLOW_RHO_AIR * (1.0 - FLOW_ORIFICE_BETA4);
+                let velocity_term = ndir_ln_sqrt_approx(2.0 * abs_dp / denominator);
+
+                // Q (m^3/s) = Cd * A2 * velocity_term
+                let q_m3_s = FLOW_ORIFICE_CD * FLOW_ORIFICE_A2 * velocity_term;
+
+                // Konversi m^3/s ke L/min (x 60000)
+                let sign = if dp_pa < 0.0 { -1.0 } else { 1.0 };
+                flow_lpm = sign * q_m3_s * 60000.0;
+
+                // EMA filter
+                flow_lpm = flow_ema.update(flow_lpm);
+            }
+            usb_println!("FLOW_INLET = {:.2}", flow_lpm);
     }
+}
+
+/// Fast square root approximation using Newton-Raphson (2 iterations).
+/// Suitable for no_std embedded without libm.
+fn ndir_ln_sqrt_approx(x: f32) -> f32 {
+    if x <= 0.0 { return 0.0; }
+    // Initial guess using bit manipulation (fast inverse sqrt trick, inverted)
+    let mut guess = x;
+    let half = 0.5 * x;
+    let mut i = guess.to_bits();
+    i = 0x5f3759df - (i >> 1); // fast inverse sqrt seed
+    guess = f32::from_bits(i);
+    // Two Newton-Raphson iterations for 1/sqrt(x)
+    guess = guess * (1.5 - half * guess * guess);
+    guess = guess * (1.5 - half * guess * guess);
+    // Return sqrt(x) = x * (1/sqrt(x))
+    x * guess
 }

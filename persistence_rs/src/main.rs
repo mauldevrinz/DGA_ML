@@ -18,6 +18,11 @@ lazy_static! {
     static ref RE_SETPOINT: Regex = Regex::new(r"^(?:ACK )?SETPOINT\s*=\s*(-?\d+\.\d+)").unwrap();
     static ref RE_PELTIER_MODE: Regex = Regex::new(r"PELTIER_MODE\s*=\s*(\w+)").unwrap();
     static ref RE_INA: Regex = Regex::new(r"INA226_(\d+)\s+Vbus\s*=\s*(-?\d+\.?\d*)\s*V,\s*Vshunt\s*=\s*(-?\d+\.?\d*)\s*V,\s*I\s*=\s*(-?\d+\.?\d*)\s*A,\s*P\s*=\s*(-?\d+\.?\d*)\s*W").unwrap();
+    static ref RE_FLOW: Regex = Regex::new(r"FLOW_INLET\s*=\s*(-?\d+\.\d+)").unwrap();
+    static ref RE_NDIR_RATIO: Regex = Regex::new(r"NDIR_RATIO\s*=\s*(-?\d+\.\d+)").unwrap();
+    static ref RE_NDIR_BASELINE: Regex = Regex::new(r"NDIR_BASELINE\s*=\s*(-?\d+\.\d+)").unwrap();
+    static ref RE_NDIR_RESPONSE: Regex = Regex::new(r"NDIR_RESPONSE\s*=\s*(-?\d+\.\d+)").unwrap();
+    static ref RE_NDIR_ABSORBANCE: Regex = Regex::new(r"NDIR_ABSORBANCE\s*=\s*(-?\d+\.\d+)").unwrap();
 }
 
 const ADC_SENSOR_NAMES: [&str; 16] = [
@@ -27,7 +32,7 @@ const ADC_SENSOR_NAMES: [&str; 16] = [
     "ir12em_act", "ir12em_ref",
 ];
 
-const NUMERIC_FIELDS: [&str; 30] = [
+const NUMERIC_FIELDS: [&str; 35] = [
     "tgs2600", "tgs2611", "tgs2610", "tgs822", "tgs813",
     "mq2", "mq6", "mq8", "mq4", "mq3",
     "mq135", "mq9", "mq7", "mq5",
@@ -38,11 +43,13 @@ const NUMERIC_FIELDS: [&str; 30] = [
     "ina_sensor_mcu_v", "ina_sensor_mcu_i", "ina_sensor_mcu_p",
     "kria_v", "kria_i", "kria_p",
     "setpoint_c",
+    "flow_inlet",
+    "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance"
 ];
 
 #[derive(Default, Clone, Debug)]
 struct Sample {
-    values: [Option<f64>; 30],
+    values: [Option<f64>; 35],
     peltier_mode: Option<String>,
 }
 
@@ -170,6 +177,22 @@ impl SensorPersistence {
                     updated = true;
                 }
             }
+        }
+        
+        if let Some(caps) = RE_FLOW.captures(line) {
+            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("flow_inlet", v); updated = true; }
+        }
+        if let Some(caps) = RE_NDIR_RATIO.captures(line) {
+            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("ndir_ratio", v); updated = true; }
+        }
+        if let Some(caps) = RE_NDIR_BASELINE.captures(line) {
+            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("ndir_baseline", v); updated = true; }
+        }
+        if let Some(caps) = RE_NDIR_RESPONSE.captures(line) {
+            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("ndir_response", v); updated = true; }
+        }
+        if let Some(caps) = RE_NDIR_ABSORBANCE.captures(line) {
+            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("ndir_absorbance", v); updated = true; }
         }
         
         if !updated || self.current.get("ir12em_ref").is_none() {
