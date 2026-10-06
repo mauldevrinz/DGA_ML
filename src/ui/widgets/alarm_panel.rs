@@ -21,7 +21,7 @@ pub fn alarm_panel(ui: &mut Ui, current_fault: Option<FaultClass>) {
             egui::Frame::NONE
                 .fill(bg_color)
                 .corner_radius(6)
-                .stroke(Stroke::new(1.0, if is_active { class.color() } else { theme::BORDER }))
+                .stroke(Stroke::new(1.0_f32, if is_active { class.color() } else { theme::BORDER }))
                 .inner_margin(12.0)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {

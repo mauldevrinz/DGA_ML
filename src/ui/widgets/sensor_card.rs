@@ -5,7 +5,7 @@ use crate::ui::theme::{PANEL_BG, ACCENT_BLUE, TEXT_MUTED};
 
 pub fn sensor_card(ui: &mut Ui, name: &str, stats: &SensorStats, unit: &str) {
     let card_color = PANEL_BG;
-    let stroke = Stroke::new(1.0, Color32::from_rgb(30, 41, 59));
+    let stroke = Stroke::new(1.0_f32, Color32::from_rgb(30, 41, 59));
 
     egui::Frame::NONE
         .fill(card_color)

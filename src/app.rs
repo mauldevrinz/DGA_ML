@@ -66,7 +66,7 @@ impl eframe::App for DgaApp {
                         .min_size(egui::vec2(ui.available_width(), 40.0));
                     
                     if is_selected {
-                        btn = btn.stroke(egui::Stroke::new(1.0, theme::ACCENT_BLUE));
+                        btn = btn.stroke(egui::Stroke::new(1.0_f32, theme::ACCENT_BLUE));
                     }
                     
                     ui.add(btn)

@@ -56,22 +56,22 @@ pub fn apply_scada_theme(ctx: &eframe::egui::Context) {
     visuals.window_corner_radius = egui::CornerRadius::same(10);
 
     visuals.widgets.noninteractive.bg_fill = PANEL_BG;
-    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(8);
 
     visuals.widgets.inactive.bg_fill = SURFACE;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
     visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(8);
 
     visuals.widgets.hovered.bg_fill = Color32::from_rgb(40, 50, 80);
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_BLUE);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT_BLUE);
     visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(8);
 
     visuals.widgets.active.bg_fill = ACCENT_BLUE;
     visuals.widgets.active.corner_radius = egui::CornerRadius::same(8);
 
     visuals.selection.bg_fill = Color32::from_rgba_premultiplied(56, 136, 255, 60);
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT_BLUE);
+    visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT_BLUE);
 
     visuals.extreme_bg_color = BG_DARK;
     visuals.faint_bg_color = CARD_BG;
@@ -86,7 +86,7 @@ pub fn card_frame(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
     egui::Frame::NONE
         .fill(CARD_BG)
         .corner_radius(10)
-        .stroke(Stroke::new(1.0, BORDER))
+        .stroke(Stroke::new(1.0_f32, BORDER))
         .inner_margin(16.0)
         .show(ui, |ui| {
             add_contents(ui);

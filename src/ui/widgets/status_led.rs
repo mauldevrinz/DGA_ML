@@ -11,7 +11,7 @@ pub fn status_led(ui: &mut Ui, color: Color32, radius: f32) -> egui::Response {
         ui.painter().circle_stroke(
             center,
             radius,
-            Stroke::new(1.0, Color32::WHITE.linear_multiply(0.3)),
+            Stroke::new(1.0_f32, Color32::WHITE.linear_multiply(0.3)),
         );
     }
     response
