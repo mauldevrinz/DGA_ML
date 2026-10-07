@@ -32,6 +32,7 @@ import glob
 import numpy as np
 import pandas as pd
 import pickle
+import time
 from pathlib import Path
 from copy import deepcopy
 import warnings
@@ -83,8 +84,16 @@ except ImportError:
 # =============================================================================
 DATA_ROOT = "data/raw"
 UNSEEN_ROOT = "data/unseen"
-SENSOR_NAMES = ["tgs2600", "mq135", "mq3", "mq6", "mq7", "tgs2602", "tgs2611", "tgs2620"]
-N_SENSORS = 8
+SENSOR_NAMES = [
+    "mos0_mV", "mos1_mV", "mos2_mV", "mos3_mV", "mos4_mV", "mos5_mV", "mos6_mV", "mos7_mV",
+    "mos8_mV", "mos9_mV", "mos10_mV", "mos11_mV", "mos12_mV", "mos13_mV", "mos14_mV", "mos15_mV",
+    "temp_chamber_C", "temp_oil_C", "humidity_chamber_pct", "humidity_oil_pct",
+    "ina226_1_vbus_V", "ina226_1_current_mA", "ina226_1_power_W",
+    "ina226_2_vbus_V", "ina226_2_current_mA", "ina226_2_power_W",
+    "kria_vbus_V", "kria_current_mA", "kria_power_W",
+    "ndir_ratio", "ndir_baseline", "ndir_response_pct", "ndir_absorbance_au", "flow_inlet"
+]
+N_SENSORS = len(SENSOR_NAMES)
 N_TIMESTEPS = 300
 
 GAS_NAMES = ["Udara_Bersih", "Asetilena", "Etilena", "Hidrogen", "Metana", "Alcohol"]
@@ -147,7 +156,9 @@ def load_data_for_tsfresh(data_root):
                     df = pd.read_csv(csv_file)
                     if len(df) >= N_TIMESTEPS:
                         df = df.iloc[:N_TIMESTEPS].copy()
-                        df = df.iloc[:, 1:N_SENSORS + 1]
+                        # Pastikan kolom sesuai dengan SENSOR_NAMES
+                        # Kolom 0 adalah 'time', maka ambil kolom 1 dst
+                        df = df[SENSOR_NAMES].copy()  # Lebih aman pakai nama kolom jika ada headernya, tapi kita asumsikan kolom 1 s.d 34
                         df.columns = SENSOR_NAMES
 
                         df['id'] = sample_id
@@ -451,23 +462,28 @@ def train_all_models(X, Y, gas_idx_series):
 
     # ---- 1. SPIKING NEURAL NETWORK ----
     print("\n   🧠 [1/3] Training Spiking Neural Network (LIF)...")
+    start_snn = time.time()
     snn_model = train_snn(
         X_train_sc, Y_train, X_val_sc, Y_val,
         n_features=X_scaled.shape[1],
         n_epochs=100, lr=1e-3, batch_size=32
     )
+    snn_time = time.time() - start_snn
 
     # Evaluate SNN
     snn_model.eval()
+    start_infer = time.time()
     with torch.no_grad():
         device = next(snn_model.parameters()).device
         snn_preds = snn_model(torch.FloatTensor(X_val_sc).to(device)).cpu().numpy()
+    snn_infer_ms = (time.time() - start_infer) / len(X_val_sc) * 1000
+    
     snn_binary = (snn_preds > 0.5).astype(int)
     snn_acc = accuracy_score(Y_val, snn_binary)
     snn_f1 = f1_score(Y_val, snn_binary, average='macro')
     snn_hamming = hamming_loss(Y_val, snn_binary)
-    print(f"      SNN — Subset Acc: {snn_acc:.4f} | Macro F1: {snn_f1:.4f} | Hamming Loss: {snn_hamming:.4f}")
-    results['snn'] = {'model': snn_model, 'acc': snn_acc, 'f1': snn_f1, 'hamming': snn_hamming}
+    print(f"      SNN — Subset Acc: {snn_acc:.4f} | Macro F1: {snn_f1:.4f} | Hamming Loss: {snn_hamming:.4f} | Waktu: {snn_time:.2f}s | Inferensi: {snn_infer_ms:.2f}ms")
+    results['snn'] = {'model': snn_model, 'acc': snn_acc, 'f1': snn_f1, 'hamming': snn_hamming, 'time': snn_time, 'infer_ms': snn_infer_ms}
 
     # ---- 2. RANDOM FOREST ----
     print("\n   🌲 [2/3] Training Random Forest (Multi-Output)...")
@@ -477,11 +493,18 @@ def train_all_models(X, Y, gas_idx_series):
     }
     rf_base = MultiOutputClassifier(RandomForestClassifier(random_state=42))
     rf_cv = GridSearchCV(rf_base, param_grid_rf, cv=3, scoring='accuracy', n_jobs=-1)
+    
+    start_rf = time.time()
     rf_cv.fit(X_train_sc, Y_train)
+    rf_time = time.time() - start_rf
+    
     rf_model = rf_cv.best_estimator_
     print(f"      RF Best Params: {rf_cv.best_params_}")
 
+    start_infer = time.time()
     rf_preds_binary = rf_model.predict(X_val_sc)
+    rf_infer_ms = (time.time() - start_infer) / len(X_val_sc) * 1000
+    
     # Get probabilities per gas
     rf_preds_proba = np.column_stack([
         est.predict_proba(X_val_sc)[:, 1] if est.predict_proba(X_val_sc).shape[1] > 1
@@ -491,8 +514,8 @@ def train_all_models(X, Y, gas_idx_series):
     rf_acc = accuracy_score(Y_val, rf_preds_binary)
     rf_f1 = f1_score(Y_val, rf_preds_binary, average='macro')
     rf_hamming = hamming_loss(Y_val, rf_preds_binary)
-    print(f"      RF  — Subset Acc: {rf_acc:.4f} | Macro F1: {rf_f1:.4f} | Hamming Loss: {rf_hamming:.4f}")
-    results['rf'] = {'model': rf_model, 'acc': rf_acc, 'f1': rf_f1, 'hamming': rf_hamming}
+    print(f"      RF  — Subset Acc: {rf_acc:.4f} | Macro F1: {rf_f1:.4f} | Hamming Loss: {rf_hamming:.4f} | Waktu: {rf_time:.2f}s | Inferensi: {rf_infer_ms:.2f}ms")
+    results['rf'] = {'model': rf_model, 'acc': rf_acc, 'f1': rf_f1, 'hamming': rf_hamming, 'time': rf_time, 'infer_ms': rf_infer_ms}
 
     # ---- 3. SVM ----
     print("\n   📐 [3/3] Training SVM (Multi-Output, RBF)...")
@@ -502,11 +525,18 @@ def train_all_models(X, Y, gas_idx_series):
     }
     svm_base = MultiOutputClassifier(SVC(probability=True, random_state=42))
     svm_cv = GridSearchCV(svm_base, param_grid_svm, cv=3, scoring='accuracy', n_jobs=-1)
+    
+    start_svm = time.time()
     svm_cv.fit(X_train_sc, Y_train)
+    svm_time = time.time() - start_svm
+    
     svm_model = svm_cv.best_estimator_
     print(f"      SVM Best Params: {svm_cv.best_params_}")
 
+    start_infer = time.time()
     svm_preds_binary = svm_model.predict(X_val_sc)
+    svm_infer_ms = (time.time() - start_infer) / len(X_val_sc) * 1000
+    
     svm_preds_proba = np.column_stack([
         est.predict_proba(X_val_sc)[:, 1] if est.predict_proba(X_val_sc).shape[1] > 1
         else est.predict_proba(X_val_sc)[:, 0]
@@ -515,17 +545,31 @@ def train_all_models(X, Y, gas_idx_series):
     svm_acc = accuracy_score(Y_val, svm_preds_binary)
     svm_f1 = f1_score(Y_val, svm_preds_binary, average='macro')
     svm_hamming = hamming_loss(Y_val, svm_preds_binary)
-    print(f"      SVM — Subset Acc: {svm_acc:.4f} | Macro F1: {svm_f1:.4f} | Hamming Loss: {svm_hamming:.4f}")
-    results['svm'] = {'model': svm_model, 'acc': svm_acc, 'f1': svm_f1, 'hamming': svm_hamming}
+    print(f"      SVM — Subset Acc: {svm_acc:.4f} | Macro F1: {svm_f1:.4f} | Hamming Loss: {svm_hamming:.4f} | Waktu: {svm_time:.2f}s | Inferensi: {svm_infer_ms:.2f}ms")
+    results['svm'] = {'model': svm_model, 'acc': svm_acc, 'f1': svm_f1, 'hamming': svm_hamming, 'time': svm_time, 'infer_ms': svm_infer_ms}
 
     # Summary
     print("\n   📊 Ringkasan Perbandingan Model:")
-    print(f"   {'Model':<15} {'Subset Acc':<14} {'Macro F1':<12} {'Hamming Loss'}")
-    print(f"   {'─'*55}")
+    print(f"   {'Model':<10} {'Subset Acc':<12} {'Macro F1':<10} {'Hamming':<10} {'Train Time':<12} {'Inference/Sample'}")
+    print(f"   {'─'*80}")
     for name in ['snn', 'rf', 'svm']:
         r = results[name]
         star = " ⭐" if r['f1'] == max(results[n]['f1'] for n in results) else ""
-        print(f"   {name.upper():<15} {r['acc']:<14.4f} {r['f1']:<12.4f} {r['hamming']:.4f}{star}")
+        print(f"   {name.upper():<10} {r['acc']:<12.4f} {r['f1']:<10.4f} {r['hamming']:<10.4f} {r['time']:<12.2f} {r['infer_ms']:.3f} ms{star}")
+
+    # Detailed report for Random Forest (sebagai contoh model yang sering terbaik)
+    print("\n   📋 Laporan Detail per Gas (Random Forest):")
+    print(classification_report(Y_val, rf_preds_binary, target_names=GAS_NAMES, zero_division=0))
+
+    # Tampilkan contoh confidence score (probabilitas) untuk 2 sampel pertama
+    print("\n   🔍 Contoh Output Confidence (Probabilitas) Multi-Label - Random Forest:")
+    for i in range(min(2, len(X_val_sc))):
+        print(f"      Sampel {i+1}:")
+        print(f"      - Label Asli (Ground Truth) : {dict(zip(GAS_NAMES, Y_val[i]))}")
+        
+        # Format persentase untuk probabilitas
+        confidences = {gas: f"{prob*100:.1f}%" for gas, prob in zip(GAS_NAMES, rf_preds_proba[i])}
+        print(f"      - Prediksi Confidence Model : {confidences}\n")
 
     return results, scaler
 
