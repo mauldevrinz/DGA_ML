@@ -96,9 +96,9 @@ SENSOR_NAMES = [
 N_SENSORS = len(SENSOR_NAMES)
 N_TIMESTEPS = 300
 
-GAS_NAMES = ["Udara_Bersih", "Asetilena", "Etilena", "Hidrogen", "Metana", "Alcohol"]
-GAS_FOLDERS = ["udara_bersih", "asetilena", "etilena", "hidrogen", "metana", "alcohol"]
-N_GASES = 6
+GAS_NAMES = ["AIR", "C2H2", "C2H4", "H2", "CH4"]
+GAS_FOLDERS = ["AIR", "C2H2", "C2H4", "H2", "CH4"]
+N_GASES = 5
 
 # IEC 60599 Fault Categories
 IEC_FAULTS = {
@@ -590,12 +590,11 @@ def diagnose_iec60599(gas_confidences):
       - Berdasarkan Key Gas Method dan rasio gas
     """
     # Ambil confidence (0-100 scale)
-    c2h2 = gas_confidences.get('Asetilena', 0)    # Acetylene
-    c2h4 = gas_confidences.get('Etilena', 0)       # Ethylene
-    h2   = gas_confidences.get('Hidrogen', 0)       # Hydrogen
-    ch4  = gas_confidences.get('Metana', 0)         # Methane
-    udara = gas_confidences.get('Udara_Bersih', 0)  # Clean Air
-    alcohol = gas_confidences.get('Alcohol', 0)      # Alcohol
+    c2h2 = gas_confidences.get('C2H2', 0)    # Acetylene
+    c2h4 = gas_confidences.get('C2H4', 0)    # Ethylene
+    h2   = gas_confidences.get('H2', 0)      # Hydrogen
+    ch4  = gas_confidences.get('CH4', 0)     # Methane
+    udara = gas_confidences.get('AIR', 0)    # Clean Air
 
     # Threshold: gas dianggap "signifikan" jika confidence > 30%
     SIGNIFICANT = 30
