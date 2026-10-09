@@ -52,8 +52,13 @@ if ! python3 -c "import numpy, websockets, usb, requests" >/dev/null 2>&1; then
     exit 1
 fi
 USER_SITE=$(python3 -m site --user-site)
-sudo PYTHONPATH="$USER_SITE:$PYTHONPATH" python3 serial_ws.py &
-PYTHON_PID=$!
+if pgrep -f "[s]erial_ws.py" >/dev/null; then
+  echo "WebSocket server sudah berjalan; memakai instance yang ada."
+  PYTHON_PID=$(pgrep -f "[s]erial_ws.py" | head -1)
+else
+  sudo PYTHONPATH="$USER_SITE:$PYTHONPATH" python3 serial_ws.py &
+  PYTHON_PID=$!
+fi
 sleep 2
 if ! sudo kill -0 "$PYTHON_PID" 2>/dev/null; then
     echo "❌ Python WebSocket Server gagal dijalankan."

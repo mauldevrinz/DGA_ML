@@ -19,8 +19,10 @@ const SEVERITY_STYLE = {
 
 const Classification = () => {
   const [isRunning, setIsRunning] = useState(false);
+  const [acquisitionActive, setAcquisitionActive] = useState(() => localStorage.getItem("dga_acquisition_active") === "true");
   const [wsConnected, setWsConnected] = useState(false);
   const wsRef = useRef(null);
+  const csvModeRef = useRef(false);
   const intervalRef = useRef(null);
 
   // Latest sensor data received from Acquisition stream
@@ -56,6 +58,32 @@ const Classification = () => {
         try {
           const json = JSON.parse(line);
           if (json.type === 'SNN_RESULT') {
+            if (csvModeRef.current) {
+              csvModeRef.current = false;
+              if (json.ok) {
+                const gas = Object.entries(json.gas_confidences || {});
+                const gasText = gas.map(([name, value]) => `${name}: ${value}%`).join('\n');
+                const diagnosis = json.iec_diagnosis || {};
+                window.alert(`CSV Prediction
+
+Fault class: ${diagnosis.fault_code || ' '} - ${diagnosis.fault_type || ' '}
+Severity: ${diagnosis.severity || ' '}
+
+Gas composition:
+${gasText}
+
+Dominant: ${json.predicted_gas || ' '} (${((json.confidence || 0) * 100).toFixed(1)}%)
+
+Feature extraction: ${json.feature_latency_ms ?? ' '} ms
+FPGA inference: ${json.latency_ms ?? ' '} ms
+Total latency: ${json.total_latency_ms ?? ' '} ms`);
+              } else {
+                window.alert(`CSV Prediction failed
+
+${json.error || 'Unknown FPGA error'}`);
+              }
+              return;
+            }
             if (json.ok) {
               setSnnResult(json);
               setLatency(json.latency_ms);
@@ -129,7 +157,15 @@ const Classification = () => {
       sensors.push(latestSensorData[`mos${i}`] || 0);
     }
 
-    ws.send(JSON.stringify({ type: 'SNN_INFER', sensors }));
+    csvModeRef.current = true;
+          ws.send(JSON.stringify({ type: 'SNN_INFER', sensors }));
+  }, []);
+
+  useEffect(() => {
+    const syncAcquisition = () => setAcquisitionActive(localStorage.getItem("dga_acquisition_active") === "true");
+    window.addEventListener("storage", syncAcquisition);
+    const timer = setInterval(syncAcquisition, 1000);
+    return () => { window.removeEventListener("storage", syncAcquisition); clearInterval(timer); };
   }, []);
 
   // Start/stop live inference loop
@@ -148,7 +184,7 @@ const Classification = () => {
       sendInference();
       intervalRef.current = setInterval(sendInference, 1000);
     }
-  }, [isRunning, wsConnected, connectWs, sendInference]);
+  }, [isRunning, wsConnected, acquisitionActive, connectWs, sendInference]);
 
   // Auto-connect on mount
   useEffect(() => {
@@ -170,6 +206,21 @@ const Classification = () => {
       // Parse header to find sensor columns
       const header = lines[0].split(',').map(h => h.trim());
       const dataLines = lines.slice(1);
+      const rows = dataLines.slice(0, 288).map(line => {
+        const cols = line.split(',');
+        return Object.fromEntries(header.map((name, i) => [name, parseFloat(cols[i]) || 0]));
+      });
+      const csvWs = wsRef.current;
+      if (!csvWs || csvWs.readyState !== WebSocket.OPEN) {
+        alert("Backend WebSocket belum terhubung. Tunggu status Backend Connected lalu coba lagi.");
+        return;
+      }
+      if (csvWs && csvWs.readyState === WebSocket.OPEN) {
+        csvModeRef.current = true;
+        csvWs.send(JSON.stringify({ type: 'SNN_CSV_INFER', rows }));
+        alert(`CSV dikirim untuk inference: ${rows.length}/288 baris.`);
+        return;
+      }
 
       let rowIdx = 0;
       const processRow = () => {

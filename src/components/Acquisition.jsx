@@ -371,6 +371,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       setCurrentPhase('');
       setPhaseTimeLeft(0);
       setSystemRunning(false);
+      localStorage.setItem("dga_acquisition_active", "false");
       // Stop recording
       setIsRecording(false);
       recordingRef.current = false;
@@ -431,6 +432,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       setCurrentPhase('');
       setPhaseTimeLeft(0);
       setSystemRunning(false);
+      localStorage.setItem("dga_acquisition_active", "false");
       // Stop recording
       setIsRecording(false);
       recordingRef.current = false;
@@ -493,6 +495,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
     // Start system
     setSystemRunning(true);
+    localStorage.setItem("dga_acquisition_active", "true");
     startNextPhase();
   }, [idleDuration, injectDuration, purgeDuration, pump1Pwm, sendCommand, dataHistory.length, startNextPhase]);
 
