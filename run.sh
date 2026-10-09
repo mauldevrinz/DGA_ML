@@ -56,7 +56,9 @@ if pgrep -f "[s]erial_ws.py" >/dev/null; then
   echo "WebSocket server sudah berjalan; memakai instance yang ada."
   PYTHON_PID=$(pgrep -f "[s]erial_ws.py" | head -1)
 else
-  sudo PYTHONPATH="$USER_SITE:$PYTHONPATH" python3 serial_ws.py &
+  mkdir -p logs
+  echo "[$(date -Is)] Starting serial_ws.py" >> logs/serial_ws.log
+  sudo PYTHONUNBUFFERED=1 PYTHONPATH="$USER_SITE:$PYTHONPATH" python3 serial_ws.py >> logs/serial_ws.log 2>&1 &
   PYTHON_PID=$!
 fi
 sleep 2
