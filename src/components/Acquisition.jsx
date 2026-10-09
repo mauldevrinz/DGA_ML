@@ -200,7 +200,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
         const matchFlow = line.match(/FLOW_INLET\s*=\s*(-?\d+\.?\d*)/);
         if (matchFlow) {
-          currentData.flow_inlet = parseFloat(matchFlow[1]);
+          currentData.flow_inlet = Math.abs(parseFloat(matchFlow[1]));
           updated = true;
         }
 
@@ -647,6 +647,22 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     setBaselines({});
     dataSnapshotIndexRef.current = 0;
   };
+
+  const [safetyWarning, setSafetyWarning] = useState(null);
+
+  // Safety check effect
+  useEffect(() => {
+    if (dataHistory.length > 0) {
+      const latest = dataHistory[dataHistory.length - 1];
+      if (latest.peltier_mode && latest.peltier_mode.startsWith('SAFETY_')) {
+         if (latest.peltier_mode === 'SAFETY_COOL') setSafetyWarning("OVERHEAT DETECTED (≥ 45°C)! Peltier forced to COOL mode to protect sensors.");
+         else if (latest.peltier_mode === 'SAFETY_HEAT') setSafetyWarning("FREEZING DETECTED (≤ 5°C)! Peltier forced to HEAT mode to protect sensors.");
+         else if (latest.peltier_mode === 'SAFETY_OFF') setSafetyWarning("HIGH HUMIDITY (≥ 85%)! System forced OFF to protect sensors.");
+      } else {
+         setSafetyWarning(null);
+      }
+    }
+  }, [dataHistory]);
 
   return (
     <div className="page-container">
@@ -1317,6 +1333,19 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       )}
 
 
+
+      {/* ===== SAFETY WARNING POPUP ===== */}
+      {safetyWarning && (
+        <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(255,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div className="modal-content" style={{ backgroundColor: '#fee2e2', color: '#991b1b', padding: '28px', borderRadius: '12px', width: '500px', border: '2px solid #ef4444', boxShadow: '0 25px 50px -12px rgba(239, 68, 68, 0.4)', textAlign: 'center' }}>
+            <div style={{ fontSize: '48px', marginBottom: '10px' }}>⚠️</div>
+            <h3 style={{ fontSize: '20px', fontWeight: 'bold', marginBottom: '12px', marginTop: 0 }}>SAFETY OVERRIDE ACTIVE</h3>
+            <p style={{ fontSize: '16px', lineHeight: '1.5', margin: 0, fontWeight: '500' }}>
+              {safetyWarning}
+            </p>
+          </div>
+        </div>
+      )}
 
     </div>
   );

@@ -5,12 +5,164 @@ import websockets
 import usb.core
 import usb.util
 import threading
+import multiprocessing as mp
 import time
 import os
 import base64
 import math
+import struct
+import numpy as np
 
 from fuzzy_pid import FuzzyPIDController
+
+# --- SNN FPGA inference setup ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PARAMS_FILE = os.path.join(SCRIPT_DIR, "fpga", "bitstream", "params.bin")
+_snn_params_data = None
+_snn_lock = threading.Lock()
+
+def _load_snn_params():
+    """Load SNN parameters from disk (once)."""
+    global _snn_params_data
+    if _snn_params_data is None:
+        if os.path.exists(PARAMS_FILE):
+            with open(PARAMS_FILE, "rb") as f:
+                _snn_params_data = f.read()
+            print(f"SNN params loaded: {len(_snn_params_data)} bytes")
+        else:
+            print(f"Warning: SNN params not found at {PARAMS_FILE}")
+    return _snn_params_data
+
+def _diagnose_iec60599(gas_confidences):
+    """
+    Rule-based IEC 60599 fault diagnosis from gas composition confidences.
+    Matches logic from colab/DGA_ML_GasComposition_Training.py
+    Input: dict with keys 'AIR','C2H2','C2H4','H2','CH4' (confidence 0-100)
+    Returns: dict with fault_code, fault_type, description, severity
+    """
+    c2h2 = gas_confidences.get('C2H2', 0)
+    c2h4 = gas_confidences.get('C2H4', 0)
+    h2   = gas_confidences.get('H2', 0)
+    ch4  = gas_confidences.get('CH4', 0)
+    udara = gas_confidences.get('AIR', 0)
+
+    SIGNIFICANT = 30
+
+    # All gas low or clean air dominant
+    if udara > 70 and c2h2 < SIGNIFICANT and c2h4 < SIGNIFICANT and h2 < SIGNIFICANT:
+        return {"fault_code": "Normal", "fault_type": "No Fault",
+                "description": "Tidak ada fault terdeteksi", "severity": "normal"}
+
+    fault_total = c2h2 + c2h4 + h2
+    if fault_total < 10:
+        return {"fault_code": "Normal", "fault_type": "No Fault",
+                "description": "Konsentrasi fault gas terlalu rendah", "severity": "normal"}
+
+    p_c2h2 = c2h2 / fault_total
+    p_c2h4 = c2h4 / fault_total
+    p_h2   = h2 / fault_total
+    r1 = c2h2 / max(c2h4, 1)
+
+    # D2: High Energy Discharge (Arcing)
+    if p_c2h2 > 0.40 and h2 > SIGNIFICANT:
+        return {"fault_code": "D2", "fault_type": "Electrical Fault",
+                "description": f"High Energy Discharge — Arcing (C2H2/C2H4={r1:.2f})",
+                "severity": "critical"}
+
+    # D1: Low Energy Discharge (Sparking)
+    if p_c2h2 > 0.25 and c2h2 > SIGNIFICANT:
+        return {"fault_code": "D1", "fault_type": "Electrical Fault",
+                "description": f"Low Energy Discharge — Sparking (C2H2/C2H4={r1:.2f})",
+                "severity": "warning"}
+
+    # PD: Partial Discharge
+    if p_h2 > 0.50 and c2h2 < SIGNIFICANT:
+        return {"fault_code": "PD", "fault_type": "Electrical Fault",
+                "description": f"Partial Discharge (H2={p_h2:.0%})", "severity": "caution"}
+
+    # T3: Thermal Fault > 700°C
+    if p_c2h4 > 0.60 and c2h4 > 60:
+        return {"fault_code": "T3", "fault_type": "Thermal Fault",
+                "description": f"Thermal Fault > 700°C (C2H4={c2h4:.0f}%)", "severity": "critical"}
+
+    # T2: Thermal Fault 300-700°C
+    if p_c2h4 > 0.40 and c2h4 > SIGNIFICANT:
+        return {"fault_code": "T2", "fault_type": "Thermal Fault",
+                "description": f"Thermal Fault 300–700°C (C2H4={p_c2h4:.0%})", "severity": "warning"}
+
+    # T1: Thermal Fault < 300°C
+    if p_c2h4 > 0.20 or c2h4 > SIGNIFICANT:
+        return {"fault_code": "T1", "fault_type": "Thermal Fault",
+                "description": "Thermal Fault < 300°C", "severity": "caution"}
+
+    # DT: Mixed Thermal & Electrical
+    if c2h2 > SIGNIFICANT and c2h4 > SIGNIFICANT:
+        return {"fault_code": "DT", "fault_type": "Mixed Fault",
+                "description": f"Mixed Thermal & Electrical (C2H2={c2h2:.0f}%, C2H4={c2h4:.0f}%)",
+                "severity": "critical"}
+
+    return {"fault_code": "T1", "fault_type": "Thermal Fault",
+            "description": "Thermal Fault < 300°C", "severity": "caution"}
+
+
+def snn_fpga_inference(sensor_values):
+    """
+    Run SNN inference on the FPGA with given sensor values.
+    sensor_values: list of 16 float values (MOS sensor readings in mV)
+    Returns: dict with classification results
+    """
+    try:
+        # Add the fpga directory to path so we can import snn_driver
+        import sys
+        fpga_dir = os.path.join(SCRIPT_DIR, "fpga")
+        if fpga_dir not in sys.path:
+            sys.path.insert(0, fpga_dir)
+        from snn_driver import run_inference
+
+        params = _load_snn_params()
+        if params is None:
+            return {"ok": False, "error": "SNN params.bin not found"}
+
+        # Pack sensor values as float32 input
+        input_data = struct.pack(f"<{len(sensor_values)}f", *sensor_values)
+
+        # Output: 5 float32 (5 DGA fault classes)
+        output_size = 20
+
+        t0 = time.monotonic()
+        with _snn_lock:
+            result_bytes = run_inference(input_data, params, output_size, verbose=False)
+        elapsed_ms = (time.monotonic() - t0) * 1000
+
+        # Parse output — 5 neurons = confidence per gas (matches training)
+        outputs = list(struct.unpack("<5f", result_bytes))
+
+        GAS_NAMES = ["AIR", "C2H2", "C2H4", "H2", "CH4"]
+
+        # Build gas confidence dict (0-100 scale)
+        gas_confidences = {}
+        for i, name in enumerate(GAS_NAMES):
+            gas_confidences[name] = round(float(outputs[i]) * 100, 1)
+
+        # IEC 60599 rule-based fault diagnosis from gas composition
+        iec_diagnosis = _diagnose_iec60599(gas_confidences)
+
+        predicted_idx = max(range(5), key=lambda i: outputs[i])
+
+        return {
+            "ok": True,
+            "outputs": outputs,
+            "gas_names": GAS_NAMES,
+            "gas_confidences": gas_confidences,
+            "predicted_gas": GAS_NAMES[predicted_idx],
+            "predicted_idx": predicted_idx,
+            "confidence": outputs[predicted_idx],
+            "iec_diagnosis": iec_diagnosis,
+            "latency_ms": round(elapsed_ms, 2),
+        }
+    except Exception as e:
+        import traceback
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
 
 setpoint = 0.0
 fuzzy_controller = FuzzyPIDController(kp=5.0, ki=0.5, kd=1.0)
@@ -144,6 +296,7 @@ def close_serial():
 
 connect_serial()
 clients = set()
+inference_gate = asyncio.Lock()
 
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Saved Graphs")
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -242,6 +395,26 @@ def generate_gnuplot_graph(data, baselines, session_name, sensor_names):
     }
 
 
+def _snn_worker(sensor_values, result_queue):
+    try:
+        result_queue.put(snn_fpga_inference(sensor_values))
+    except BaseException as exc:
+        result_queue.put({"ok": False, "error": repr(exc)})
+
+def snn_fpga_inference_safe(sensor_values, timeout=8.0):
+    ctx=mp.get_context("fork")
+    result_queue=ctx.Queue(maxsize=1)
+    proc=ctx.Process(target=_snn_worker, args=(sensor_values, result_queue), daemon=True)
+    proc.start()
+    proc.join(timeout)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(2.0)
+        if proc.is_alive(): proc.kill()
+        return {"ok": False, "error": f"FPGA inference watchdog timeout after {timeout:.1f}s"}
+    if not result_queue.empty(): return result_queue.get()
+    return {"ok": False, "error": f"FPGA worker exited with code {proc.exitcode}"}
+
 async def handler(websocket):
     global setpoint, fuzzy_controller
     clients.add(websocket)
@@ -274,9 +447,23 @@ async def handler(websocket):
                             sensor_names=cmd['sensorNames'],
                         )
                         await websocket.send(json.dumps(result))
+
+                    if cmd.get('type') == 'SNN_INFER':
+                        # Run SNN FPGA inference with sensor data
+                        sensor_values = cmd.get('sensors', [])
+                        loop = asyncio.get_running_loop()
+                        if inference_gate.locked():
+                            result = {"ok": False, "error": "FPGA inference busy; request skipped"}
+                        else:
+                            async with inference_gate:
+                                result = await loop.run_in_executor(
+                                    None, snn_fpga_inference_safe, sensor_values
+                                )
+                        result['type'] = 'SNN_RESULT'
+                        await websocket.send(json.dumps(result))
                 except Exception as e:
                     import traceback
-                    await websocket.send(json.dumps({'ok': False, 'error': str(e), 'trace': traceback.format_exc()}))
+                    await websocket.send(json.dumps({'type': 'SNN_RESULT', 'ok': False, 'error': str(e), 'trace': traceback.format_exc()}))
                 continue
 
             # Otherwise: forward to Teensy via USB

@@ -2,12 +2,20 @@
 
 set -e
 
+echo "====================================="
+echo "🔐 Meminta akses sudo (untuk FPGA Inference)..."
+echo "====================================="
+# Meminta password sudo di awal dan menyimpannya di cache
+sudo -v
+# Update timestamp sudo di background supaya tidak expire selama script jalan
+while true; do sudo -n true; sleep 60; kill -0 "$$" || exit; done 2>/dev/null &
+
 # Cleanup background processes on exit
 cleanup() {
     echo ""
     echo "🛑 Shutting down..."
     if [ -n "${PYTHON_PID:-}" ]; then
-        kill "$PYTHON_PID" 2>/dev/null || true
+        sudo kill "$PYTHON_PID" 2>/dev/null || true
     fi
     exit 0
 }
@@ -16,7 +24,12 @@ trap cleanup INT TERM
 echo "====================================="
 echo "⚙️  Membangun Rust Backend (cargo build)..."
 echo "====================================="
-cargo build
+# Asumsi Cargo.toml ada di folder persistence_rs atau root
+if [ -f "Cargo.toml" ] || [ -f "persistence_rs/Cargo.toml" ]; then
+    (cd persistence_rs 2>/dev/null || true; cargo build)
+else
+    echo "⚠️  Cargo.toml tidak ditemukan, skip build Rust."
+fi
 
 echo ""
 echo "====================================="
@@ -31,17 +44,18 @@ fi
 
 echo ""
 echo "====================================="
-echo "🐍 Menjalankan Python WebSocket Server (serial_ws.py)..."
+echo "🐍 Menjalankan Python WebSocket Server (serial_ws.py) [SUDO]..."
 echo "====================================="
-if ! python3 -c "import numpy, skfuzzy, websockets, usb, requests" >/dev/null 2>&1; then
+if ! python3 -c "import numpy, websockets, usb, requests" >/dev/null 2>&1; then
     echo "❌ Dependensi Python belum lengkap."
     echo "   Jalankan: python3 -m pip install -r requirements.txt"
     exit 1
 fi
-python3 serial_ws.py &
+USER_SITE=$(python3 -m site --user-site)
+sudo PYTHONPATH="$USER_SITE:$PYTHONPATH" python3 serial_ws.py &
 PYTHON_PID=$!
 sleep 2
-if ! kill -0 "$PYTHON_PID" 2>/dev/null; then
+if ! sudo kill -0 "$PYTHON_PID" 2>/dev/null; then
     echo "❌ Python WebSocket Server gagal dijalankan."
     exit 1
 fi

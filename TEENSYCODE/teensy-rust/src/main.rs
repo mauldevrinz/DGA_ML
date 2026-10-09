@@ -1414,12 +1414,23 @@ fn main() -> ! {
             usb_println!("SHT31 Temp  = {:.2} C", sht31_temp);
             usb_println!("SHT31 Humi  = {:.2} %RH", sht31_hum);
 
-            // SAFETY LOGIC
-            if sht31_temp <= 15.0 || sht31_temp >= 40.0 || sht31_hum >= 85.0 {
+            // SAFETY LOGIC (Datasheet Limits: Min -10C, Max 50C)
+            // Margin -> Min Safe: 5.0C, Max Safe: 45.0C
+            if sht31_temp >= 45.0 || sht30_temp >= 45.0 {
+                set_peltier_power(100); // Paksa pendinginan penuh
+                peltier_mode = "SAFETY_COOL";
+                let _ = p15.set_high(); // Fan ON
+                usb_println!("SAFETY: OVERHEAT! Forcing COOL.");
+            } else if sht31_temp <= 5.0 || sht30_temp <= 5.0 {
+                set_peltier_power(-100); // Paksa pemanasan penuh
+                peltier_mode = "SAFETY_HEAT";
+                let _ = p15.set_high(); // Fan ON
+                usb_println!("SAFETY: FREEZING! Forcing HEAT.");
+            } else if sht31_hum >= 85.0 || sht30_hum >= 85.0 {
                 set_peltier_power(0);
                 peltier_mode = "SAFETY_OFF";
                 let _ = p15.set_low(); // Fan OFF
-                usb_println!("SAFETY: Peltier & Fan D15 OFF (Out of bounds)");
+                usb_println!("SAFETY: HUMIDITY HIGH! Peltier & Fan OFF.");
             } else {
                 let _ = p15.set_high(); // Fan ON
             }
@@ -1498,8 +1509,8 @@ fn main() -> ! {
                 let q_m3_s = FLOW_ORIFICE_CD * FLOW_ORIFICE_A2 * velocity_term;
 
                 // Konversi m^3/s ke L/min (x 60000)
-                let sign = if dp_pa < 0.0 { -1.0 } else { 1.0 };
-                flow_lpm = sign * q_m3_s * 60000.0;
+                // Nilai flow selalu absolut (non-negatif), arah aliran tidak relevan
+                flow_lpm = q_m3_s * 60000.0;
 
                 // EMA filter
                 flow_lpm = flow_ema.update(flow_lpm);

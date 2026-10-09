@@ -1,0 +1,25 @@
+/*
+ * Device-tree overlay for SNN accelerator on KV260.
+ *
+ * The SNN HLS IP is mapped at 0xB0000000 with s_axi_control (64KB).
+ * Compile: dtc -@ -O dtb -o snn_accel.dtbo snn_accel.dts
+ */
+
+/dts-v1/;
+/plugin/;
+
+&fpga_full {
+    firmware-name = "xilinx/snn_accel/snn_accel.bin";
+    resets = <&zynqmp_reset 116>;
+};
+
+&amba {
+    #address-cells = <2>;
+    #size-cells = <2>;
+
+    snn_accel: snn_top@B0000000 {
+        compatible = "generic-uio";
+        reg = <0x0 0xB0000000 0x0 0x10000>;
+        interrupt-parent = <&gic>;
+    };
+};

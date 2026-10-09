@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use regex::Regex;
 use std::env;
 use std::fs;
@@ -47,10 +47,19 @@ const NUMERIC_FIELDS: [&str; 35] = [
     "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance"
 ];
 
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug)]
 struct Sample {
     values: [Option<f64>; 35],
     peltier_mode: Option<String>,
+}
+
+impl Default for Sample {
+    fn default() -> Self {
+        Self {
+            values: [None; 35],
+            peltier_mode: None,
+        }
+    }
 }
 
 impl Sample {
@@ -125,8 +134,8 @@ impl SensorPersistence {
         ", cols);
         self.db.execute(&create_sql, []).expect("Failed to create table");
         
-        // Add kria columns just in case
-        for col in ["kria_v", "kria_i", "kria_p"] {
+        // Add newer columns just in case the db was created with older versions
+        for col in ["kria_v", "kria_i", "kria_p", "flow_inlet", "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance"] {
             let _ = self.db.execute(&format!("ALTER TABLE sensor_readings ADD COLUMN {} REAL", col), []);
         }
     }
@@ -180,7 +189,7 @@ impl SensorPersistence {
         }
         
         if let Some(caps) = RE_FLOW.captures(line) {
-            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("flow_inlet", v); updated = true; }
+            if let Ok(v) = caps[1].parse::<f64>() { self.current.set("flow_inlet", v.abs()); updated = true; }
         }
         if let Some(caps) = RE_NDIR_RATIO.captures(line) {
             if let Ok(v) = caps[1].parse::<f64>() { self.current.set("ndir_ratio", v); updated = true; }
