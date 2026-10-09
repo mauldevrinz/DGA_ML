@@ -406,10 +406,19 @@ def csv_to_model_features(rows):
     with open(feature_file) as f: feature_names = json.load(f)["feature_names"]
     with open(model_file) as f: model = json.load(f)
     sensor_names = ["mos0_mV","mos1_mV","mos2_mV","mos3_mV","mos4_mV","mos5_mV","mos6_mV","mos7_mV","mos8_mV","mos9_mV","mos10_mV","mos11_mV","mos12_mV","mos13_mV","mos14_mV","mos15_mV","temp_chamber_C","temp_oil_C","humidity_chamber_pct","humidity_oil_pct","ina226_1_vbus_V","ina226_1_current_mA","ina226_1_power_W","ina226_2_vbus_V","ina226_2_current_mA","ina226_2_power_W","kria_vbus_V","kria_current_mA","kria_power_W","ndir_ratio","ndir_baseline","ndir_response_pct","ndir_absorbance_au","flow_inlet"]
-    df=pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if df.empty or len(df) < 288:
+        raise ValueError(f'CSV membutuhkan minimal 288 baris; diterima {len(df)}')
+    missing = [name for name in sensor_names if name not in df.columns]
+    if missing:
+        raise ValueError('Kolom sensor CSV hilang: ' + ', '.join(missing))
+    df = df[sensor_names].apply(pd.to_numeric, errors='coerce')
+    invalid = [name for name in sensor_names if df[name].isna().any()]
+    if invalid:
+        raise ValueError('Nilai non-numerik/NaN pada kolom: ' + ', '.join(invalid))
     missing=[c for c in sensor_names if c not in df.columns]
     if missing: raise ValueError("CSV missing columns: " + ", ".join(missing))
-    df=df[sensor_names].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    df = df[sensor_names]
     df["id"]=0; df["time"]=np.arange(len(df))
     features=extract_features(df, column_id="id", column_sort="time", default_fc_parameters=EfficientFCParameters(), disable_progressbar=True)
     impute(features)
@@ -471,15 +480,18 @@ async def handler(websocket):
                             session_name=cmd['sessionName'],
                             sensor_names=cmd['sensorNames'],
                         )
+                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'complete','progress':100,'message':'Prediction ready'}))
                         await websocket.send(json.dumps(result))
 
                     if cmd.get('type') == 'SNN_CSV_INFER':
                         rows = cmd.get('rows', [])
+                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'validating','progress':10,'message':'Validating CSV data'}))
                         if len(rows) < 288: raise ValueError(f"CSV needs 288 rows, got {len(rows)}")
                         request_t0 = time.monotonic()
                         feature_t0 = time.monotonic()
                         values = csv_to_model_features(rows[:288])
                         feature_latency_ms = round((time.monotonic() - feature_t0) * 1000, 2)
+                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'fpga','progress':85,'message':'Running FPGA inference'}))
                         loop = asyncio.get_running_loop()
                         result = await loop.run_in_executor(None, snn_fpga_inference_safe, values)
                         result['feature_latency_ms'] = feature_latency_ms

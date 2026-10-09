@@ -36,6 +36,12 @@ const Classification = () => {
   const [history, setHistory] = useState([]);
   const [fpgaStatus, setFpgaStatus] = useState('idle'); // 'idle' | 'running' | 'error'
   const [errorMsg, setErrorMsg] = useState('');
+  const [csvProgress, setCsvProgress] = useState(null);
+  const [csvDialog, setCsvDialog] = useState(null);
+
+  const showDialog = useCallback((message, title = 'CSV Prediction') => {
+    setCsvDialog({ title, message });
+  }, []);
 
   // Connect to WebSocket
   const connectWs = useCallback(() => {
@@ -57,14 +63,19 @@ const Classification = () => {
       if (typeof line === 'string' && line.trimStart().startsWith('{')) {
         try {
           const json = JSON.parse(line);
+          if (json.type === 'CSV_PROGRESS') {
+            setCsvProgress(json);
+            return;
+          }
           if (json.type === 'SNN_RESULT') {
             if (csvModeRef.current) {
               csvModeRef.current = false;
               if (json.ok) {
+                setCsvProgress({ progress: 100, message: 'CSV prediction selesai' });
                 const gas = Object.entries(json.gas_confidences || {});
                 const gasText = gas.map(([name, value]) => `${name}: ${value}%`).join('\n');
                 const diagnosis = json.iec_diagnosis || {};
-                window.alert(`CSV Prediction
+                showDialog(`CSV Prediction
 
 Fault class: ${diagnosis.fault_code || ' '} - ${diagnosis.fault_type || ' '}
 Severity: ${diagnosis.severity || ' '}
@@ -78,7 +89,7 @@ Feature extraction: ${json.feature_latency_ms ?? ' '} ms
 FPGA inference: ${json.latency_ms ?? ' '} ms
 Total latency: ${json.total_latency_ms ?? ' '} ms`);
               } else {
-                window.alert(`CSV Prediction failed
+                showDialog(`CSV Prediction failed
 
 ${json.error || 'Unknown FPGA error'}`);
               }
@@ -202,7 +213,7 @@ ${json.error || 'Unknown FPGA error'}`);
     const reader = new FileReader();
     reader.onload = () => {
       const lines = reader.result.split('\n').filter(l => l.trim());
-      if (lines.length < 2) { alert('CSV is empty.'); return; }
+      if (lines.length < 2) { showDialog('CSV is empty.'); return; }
       // Parse header to find sensor columns
       const header = lines[0].split(',').map(h => h.trim());
       const dataLines = lines.slice(1);
@@ -210,17 +221,23 @@ ${json.error || 'Unknown FPGA error'}`);
         const cols = line.split(',');
         return Object.fromEntries(header.map((name, i) => [name, parseFloat(cols[i]) || 0]));
       });
-      const csvWs = wsRef.current;
-      if (!csvWs || csvWs.readyState !== WebSocket.OPEN) {
-        alert("Backend WebSocket belum terhubung. Tunggu status Backend Connected lalu coba lagi.");
-        return;
-      }
-      if (csvWs && csvWs.readyState === WebSocket.OPEN) {
-        csvModeRef.current = true;
-        csvWs.send(JSON.stringify({ type: 'SNN_CSV_INFER', rows }));
-        alert(`CSV dikirim untuk inference: ${rows.length}/288 baris.`);
-        return;
-      }
+      const sendCsv = (attempt = 0) => {
+        const csvWs = wsRef.current;
+        if (csvWs && csvWs.readyState === WebSocket.OPEN) {
+          csvModeRef.current = true;
+          csvWs.send(JSON.stringify({ type: 'SNN_CSV_INFER', rows }));
+          showDialog(`CSV dikirim untuk inference: ${rows.length}/288 baris.`);
+          return;
+        }
+        if (attempt < 10) {
+          if (!csvWs || csvWs.readyState === WebSocket.CLOSED) connectWs();
+          setTimeout(() => sendCsv(attempt + 1), 500);
+        } else {
+          showDialog('Backend WebSocket belum terhubung setelah 5 detik. Periksa port 8080.');
+        }
+      };
+      sendCsv();
+      return;
 
       let rowIdx = 0;
       const processRow = () => {
@@ -245,7 +262,7 @@ ${json.error || 'Unknown FPGA error'}`);
         }
       };
       processRow();
-      alert(`CSV loaded: ${dataLines.length} rows will be predicted sequentially.`);
+      showDialog(`CSV loaded: ${dataLines.length} rows will be predicted sequentially.`);
     };
     reader.readAsText(file);
     e.target.value = '';
@@ -258,6 +275,15 @@ ${json.error || 'Unknown FPGA error'}`);
 
   return (
     <div className="page-container">
+      {(csvProgress || csvDialog) && (<div role="dialog" aria-modal="true" style={{ position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, background: 'rgba(2, 6, 23, 0.72)' }}>
+        <div style={{ width: 'min(560px, 100%)', maxHeight: '80vh', overflowY: 'auto', padding: 22, borderRadius: 14, background: '#172554', color: '#fff' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 14, borderBottom: '1px solid rgba(255,255,255,.14)' }}><div><div style={{ color: '#7dd3fc', fontSize: 11, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase' }}>Inference result</div><h3 style={{ margin: '4px 0 0', color: '#fff', fontSize: 20 }}>{csvDialog?.title || 'CSV Prediction'}</h3></div><button type="button" onClick={() => { setCsvDialog(null); setCsvProgress(null); csvModeRef.current = false; }} aria-label="Close" style={{ color: '#fff', background: 'rgba(255,255,255,.12)', border: '1px solid rgba(255,255,255,.22)', borderRadius: 8, width: 32, height: 32, cursor: 'pointer', fontSize: 18 }}>x</button></div>
+          {csvProgress && csvProgress.progress < 100 && <div style={{ marginTop: 18, padding: 14, borderRadius: 10, background: 'rgba(15,23,42,.55)' }}><div style={{ color: '#fff', fontSize: 13, marginBottom: 10 }}>{csvProgress.message}</div><div style={{ height: 9, background: '#334155', borderRadius: 99, overflow: 'hidden' }}><div style={{ width: '100%', height: '100%', background: 'linear-gradient(90deg,#38bdf8,#10b981)', borderRadius: 99 }} /></div><div style={{ color: '#cbd5e1', fontSize: 11, marginTop: 7, textAlign: 'right' }}>{csvProgress.progress}%</div></div>}
+          {csvDialog?.message && <pre style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6, color: '#fff', fontFamily: 'inherit', fontSize: 13, margin: '18px 0' }}>{csvDialog.message}</pre>}
+          {csvDialog && <button type="button" onClick={() => { setCsvDialog(null); setCsvProgress(null); csvModeRef.current = false; }} style={{ color: '#fff', background: '#0ea5e9', border: 0, borderRadius: 8, padding: '10px 22px', fontWeight: 700, cursor: 'pointer', width: '100%' }}>Close</button>}
+        </div>
+      </div>)}
+
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
         <div>
           <h2 className="page-title">Real-Time DGA Classification</h2>
