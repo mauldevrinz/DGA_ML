@@ -22,6 +22,17 @@ cleanup() {
 trap cleanup INT TERM
 
 echo "====================================="
+echo "====================================="
+echo "Ensuring SNN FPGA accelerator is active..."
+echo "====================================="
+if [ -e /sys/firmware/devicetree/base/axi/snn_top@B0000000 ]; then
+  echo "SNN overlay already active; skipping loader."
+else
+  echo "SNN overlay not active; loading bitstream..."
+  sudo ./fpga/load_snn.sh
+fi
+echo ""
+
 echo "⚙️  Membangun Rust Backend (cargo build)..."
 echo "====================================="
 # Asumsi Cargo.toml ada di folder persistence_rs atau root
