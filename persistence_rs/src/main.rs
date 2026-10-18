@@ -32,7 +32,7 @@ const ADC_SENSOR_NAMES: [&str; 16] = [
     "ir12em_act", "ir12em_ref",
 ];
 
-const NUMERIC_FIELDS: [&str; 35] = [
+const NUMERIC_FIELDS: [&str; 37] = [
     "tgs2600", "tgs2611", "tgs2610", "tgs822", "tgs813",
     "mq2", "mq6", "mq8", "mq4", "mq3",
     "mq135", "mq9", "mq7", "mq5",
@@ -44,19 +44,20 @@ const NUMERIC_FIELDS: [&str; 35] = [
     "kria_v", "kria_i", "kria_p",
     "setpoint_c",
     "flow_inlet",
-    "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance"
+    "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance",
+    "ndir_valid", "ndir_baseline_ready"
 ];
 
 #[derive(Clone, Debug)]
 struct Sample {
-    values: [Option<f64>; 35],
+    values: [Option<f64>; 37],
     peltier_mode: Option<String>,
 }
 
 impl Default for Sample {
     fn default() -> Self {
         Self {
-            values: [None; 35],
+            values: [None; 37],
             peltier_mode: None,
         }
     }
@@ -135,14 +136,69 @@ impl SensorPersistence {
         self.db.execute(&create_sql, []).expect("Failed to create table");
         
         // Add newer columns just in case the db was created with older versions
-        for col in ["kria_v", "kria_i", "kria_p", "flow_inlet", "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance"] {
+        for col in ["kria_v", "kria_i", "kria_p", "flow_inlet", "ndir_ratio", "ndir_baseline", "ndir_response", "ndir_absorbance", "ndir_valid", "ndir_baseline_ready"] {
             let _ = self.db.execute(&format!("ALTER TABLE sensor_readings ADD COLUMN {} REAL", col), []);
         }
     }
 
     fn process_line(&mut self, line: &str) {
         let mut updated = false;
-        
+
+        // Directly parse full SAMPLE frame if present
+        if line.starts_with("SAMPLE,") {
+            let parts: Vec<&str> = line.trim().split(',').collect();
+            if parts.len() >= 34 {
+                let has_cycle = parts.len() == 35 || (
+                    parts.len() > 35 && parts[1].parse::<i64>().map_or(false, |c| c >= 0 && c <= 100)
+                );
+                let start_idx = if has_cycle { 3 } else { 2 };
+                if parts.len() >= start_idx + 32 {
+                    // 16 ADC channels
+                    for i in 0..16 {
+                        if let Ok(raw) = parts[start_idx + i].parse::<f64>() {
+                            let mv = raw * (4.096 / 32768.0) * 1000.0;
+                            self.current.set(ADC_SENSOR_NAMES[i], mv);
+                        }
+                    }
+                    // NDIR: ratio, baseline, response, absorbance
+                    if let Ok(v) = parts[start_idx + 16].parse::<f64>() { self.current.set("ndir_ratio", v); }
+                    if let Ok(v) = parts[start_idx + 17].parse::<f64>() { self.current.set("ndir_baseline", v); }
+                    if let Ok(v) = parts[start_idx + 18].parse::<f64>() { self.current.set("ndir_response", v); }
+                    if let Ok(v) = parts[start_idx + 19].parse::<f64>() { self.current.set("ndir_absorbance", v); }
+                    // Climate: temp_chamber, temp_sample, hum_chamber, hum_sample
+                    if let Ok(v) = parts[start_idx + 20].parse::<f64>() { self.current.set("temp_chamber", v); }
+                    if let Ok(v) = parts[start_idx + 21].parse::<f64>() { self.current.set("temp_sample", v); }
+                    if let Ok(v) = parts[start_idx + 22].parse::<f64>() { self.current.set("hum_chamber", v); }
+                    if let Ok(v) = parts[start_idx + 23].parse::<f64>() { self.current.set("hum_sample", v); }
+                    // Flow
+                    if let Ok(v) = parts[start_idx + 24].parse::<f64>() { self.current.set("flow_inlet", v.abs()); }
+                    // INA 1
+                    if let Ok(v) = parts[start_idx + 25].parse::<f64>() { self.current.set("ina_actuator_v", v); }
+                    if let Ok(v) = parts[start_idx + 26].parse::<f64>() { self.current.set("ina_actuator_i", v); }
+                    if let Ok(v) = parts[start_idx + 27].parse::<f64>() { self.current.set("ina_actuator_p", v); }
+                    // INA 2
+                    if let Ok(v) = parts[start_idx + 28].parse::<f64>() { self.current.set("ina_sensor_mcu_v", v); }
+                    if let Ok(v) = parts[start_idx + 29].parse::<f64>() { self.current.set("ina_sensor_mcu_i", v); }
+                    if let Ok(v) = parts[start_idx + 30].parse::<f64>() { self.current.set("ina_sensor_mcu_p", v); }
+                    // Setpoint
+                    if let Ok(v) = parts[start_idx + 31].parse::<f64>() { self.current.set("setpoint_c", v); }
+                    // Optional trailing mode and NDIR data-quality flags.
+                    if let Some(mode) = parts.get(start_idx + 32) {
+                        if matches!(*mode, "OFF" | "IDLE" | "MANUAL" | "COOL" | "HEAT" | "SAFETY_COOL" | "SAFETY_HEAT" | "SAFETY_OFF") {
+                            self.current.peltier_mode = Some((*mode).to_string());
+                        }
+                    }
+                    if let Some(value) = parts.get(start_idx + 33).and_then(|v| v.parse::<f64>().ok()) {
+                        self.current.set("ndir_valid", value);
+                    }
+                    if let Some(value) = parts.get(start_idx + 34).and_then(|v| v.parse::<f64>().ok()) {
+                        self.current.set("ndir_baseline_ready", value);
+                    }
+                    updated = true;
+                }
+            }
+        }
+
         if let Some(caps) = RE_ADC.captures(line) {
             if let (Ok(idx), Ok(val)) = (caps[1].parse::<usize>(), caps[2].parse::<i32>()) {
                 if idx < ADC_SENSOR_NAMES.len() {

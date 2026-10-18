@@ -5,6 +5,7 @@ import websockets
 import usb.core
 import usb.util
 import threading
+import queue
 import multiprocessing as mp
 import time
 import os
@@ -13,6 +14,7 @@ import math
 import struct
 import numpy as np
 import json
+import re
 import pandas as pd
 from tsfresh import extract_features
 from tsfresh.feature_extraction import EfficientFCParameters
@@ -187,10 +189,15 @@ except Exception as e:
 USB_INTERFACE = 1
 USB_IN_ENDPOINT = 0x82
 USB_OUT_ENDPOINT = 0x01
-USB_WRITE_TIMEOUT_MS = 2500
+USB_WRITE_TIMEOUT_MS = 200
 command_condition = threading.Condition()
 urgent_commands = deque()
 pending_pwr = None
+pending_heartbeat = False
+phase_active = False
+phase_owner = None
+phase_task = None
+phase_ack_future = None
 
 
 def _usb_write(message):
@@ -208,10 +215,15 @@ def _usb_write(message):
 
 
 def queue_command(message, automatic=False):
-    """Queue a command, retaining only the newest automatic PWR update."""
-    global pending_pwr
+    """Queue commands, coalescing heartbeats and automatic PWR updates."""
+    global pending_pwr, pending_heartbeat, phase_active
     with command_condition:
-        if automatic:
+        if message == "HEARTBEAT":
+            pending_heartbeat = True
+        elif message.startswith("PHASE="):
+            phase_active = message.split("=", 1)[1].strip() != "OFF"
+            urgent_commands.append(message)
+        elif automatic:
             pending_pwr = message
         else:
             urgent_commands.append(message)
@@ -219,13 +231,14 @@ def queue_command(message, automatic=False):
 
 
 def usb_write_loop():
-    global pending_pwr
+    global pending_pwr, pending_heartbeat
     MAX_RETRIES = 5
     while not shutdown_event.is_set():
         with command_condition:
             command_condition.wait_for(
                 lambda: shutdown_event.is_set()
                 or urgent_commands
+                or pending_heartbeat
                 or pending_pwr is not None
             )
             if shutdown_event.is_set():
@@ -237,6 +250,11 @@ def usb_write_loop():
                     message, retries_left = item
                 else:
                     message, retries_left = item, MAX_RETRIES
+                automatic = False
+            elif pending_heartbeat:
+                message = "HEARTBEAT"
+                pending_heartbeat = False
+                retries_left = MAX_RETRIES
                 automatic = False
             else:
                 message = pending_pwr
@@ -261,6 +279,91 @@ def usb_write_loop():
                 print(f"USB command write error for {message}: {e}")
         except Exception as e:
             print(f"USB command write error for {message}: {e}")
+
+
+async def device_heartbeat_loop():
+    """Keep an active Teensy run alive independently of browser timer throttling."""
+    while not shutdown_event.is_set():
+        with command_condition:
+            active = phase_active
+        if active and dev is not None:
+            queue_command("HEARTBEAT")
+        await asyncio.sleep(1.0)
+
+
+def _resolve_phase_ack(phase):
+    future = phase_ack_future
+    if future is not None and not future.done():
+        future.set_result(phase)
+
+
+async def run_system_plan(websocket, phases, pump_pwm):
+    """Run all requested cycles on Kria so browser timer throttling cannot stall phases."""
+    global phase_task, phase_owner, phase_ack_future
+    phase_owner = websocket
+    previous_cycle = None
+    try:
+        queue_command("SYSTEM_ARM")
+        queue_command(f"PWM={pump_pwm}")
+        for item in phases:
+            if websocket not in clients or phase_owner is not websocket:
+                break
+            cycle_number = item["cycle"]
+            phase = item["phase"]
+            duration = item["duration_sec"]
+            if cycle_number != previous_cycle:
+                queue_command(f"CYCLE={cycle_number}")
+                previous_cycle = cycle_number
+            if phase == "INJECT":
+                queue_command(f"PWM={pump_pwm}")
+
+            loop = asyncio.get_running_loop()
+            phase_ack_future = loop.create_future()
+            queue_command(f"PHASE={phase}")
+            try:
+                acknowledged = await asyncio.wait_for(phase_ack_future, timeout=5.0)
+            except asyncio.TimeoutError:
+                await broadcast_message(json.dumps({
+                    "type": "SYSTEM_ERROR",
+                    "message": f"The Teensy did not acknowledge the {phase} phase within 5 seconds.",
+                }))
+                return
+            finally:
+                phase_ack_future = None
+            if acknowledged != phase:
+                raise RuntimeError(f"Unexpected phase acknowledgement: {acknowledged}")
+
+            await broadcast_message(json.dumps({
+                "type": "SYSTEM_PHASE",
+                "phase": phase,
+                "cycle": cycle_number,
+                "duration_sec": duration,
+            }))
+            await asyncio.sleep(duration)
+
+        if phase_owner is websocket:
+            await broadcast_message(json.dumps({"type": "SYSTEM_COMPLETE"}))
+    except Exception as exc:
+        await broadcast_message(json.dumps({"type": "SYSTEM_ERROR", "message": str(exc)}))
+    except asyncio.CancelledError:
+        raise
+    finally:
+        phase_ack_future = None
+        if phase_owner is websocket:
+            queue_command("PHASE=OFF")
+            phase_owner = None
+        if phase_task is asyncio.current_task():
+            phase_task = None
+
+
+def _abort_system_after_watchdog():
+    global phase_task, phase_owner, phase_active
+    if phase_task is not None and not phase_task.done():
+        phase_task.cancel()
+    phase_task = None
+    phase_owner = None
+    with command_condition:
+        phase_active = False
 
 
 def connect_serial():
@@ -450,7 +553,7 @@ def snn_fpga_inference_safe(sensor_values, timeout=8.0):
     return {"ok": False, "error": f"FPGA worker exited with code {proc.exitcode}"}
 
 async def handler(websocket):
-    global setpoint, fuzzy_controller
+    global setpoint, fuzzy_controller, phase_active, phase_owner, phase_task
     clients.add(websocket)
     print(f"Client connected. Total clients: {len(clients)}")
     try:
@@ -458,6 +561,7 @@ async def handler(websocket):
             # Detect JSON commands from GUI (not serial commands)
             if message.startswith('{'):
                 import json
+                cmd = {}
                 try:
                     cmd = json.loads(message)
                     if cmd.get('type') == 'CHAMBER_CTRL':
@@ -473,6 +577,37 @@ async def handler(websocket):
                         await websocket.send(json.dumps({'ok': True, 'type': 'CHAMBER_CTRL_ACK'}))
                         continue
 
+                    if cmd.get('type') == 'START_SYSTEM_PLAN':
+                        if phase_task is not None and not phase_task.done():
+                            raise ValueError("A system run is already active. Stop it before starting another run.")
+                        phases = cmd.get('phases')
+                        pump_pwm = max(0, min(100, int(cmd.get('pump_pwm', 0))))
+                        valid_phases = {"IDLE", "INJECT", "PURGE"}
+                        if not isinstance(phases, list) or not phases or len(phases) > 600:
+                            raise ValueError("The system plan must contain between 1 and 600 phases.")
+                        plan = []
+                        for item in phases:
+                            if not isinstance(item, dict):
+                                raise ValueError("Each system phase must be an object.")
+                            phase = str(item.get("phase", ""))
+                            cycle = int(item.get("cycle", 0))
+                            duration_sec = int(item.get("duration_sec", 0))
+                            if phase not in valid_phases or cycle < 1 or duration_sec < 1:
+                                raise ValueError("Invalid phase, cycle number, or phase duration in the system plan.")
+                            plan.append({"phase": phase, "cycle": cycle, "duration_sec": duration_sec})
+                        phase_task = asyncio.create_task(run_system_plan(websocket, plan, pump_pwm))
+                        await websocket.send(json.dumps({"type": "SYSTEM_PLAN_ACCEPTED", "phases": len(plan)}))
+                        continue
+
+                    if cmd.get('type') == 'STOP_SYSTEM':
+                        if phase_task is not None and not phase_task.done():
+                            phase_task.cancel()
+                        phase_task = None
+                        phase_owner = None
+                        queue_command("PHASE=OFF")
+                        await broadcast_message(json.dumps({"type": "SYSTEM_STOPPED"}))
+                        continue
+
                     if cmd.get('type') == 'SAVE_GRAPH':
                         result = generate_gnuplot_graph(
                             data=cmd['data'],
@@ -480,7 +615,6 @@ async def handler(websocket):
                             session_name=cmd['sessionName'],
                             sensor_names=cmd['sensorNames'],
                         )
-                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'complete','progress':100,'message':'Prediction ready'}))
                         await websocket.send(json.dumps(result))
 
                     if cmd.get('type') == 'SNN_CSV_INFER':
@@ -514,12 +648,16 @@ async def handler(websocket):
                         await websocket.send(json.dumps(result))
                 except Exception as e:
                     import traceback
-                    await websocket.send(json.dumps({'type': 'SNN_RESULT', 'ok': False, 'error': str(e), 'trace': traceback.format_exc()}))
+                    error_type = 'SYSTEM_ERROR' if cmd.get('type') in {'START_SYSTEM_PLAN', 'STOP_SYSTEM'} else 'SNN_RESULT'
+                    await websocket.send(json.dumps({'type': error_type, 'ok': False, 'message': str(e), 'error': str(e), 'trace': traceback.format_exc()}))
                 continue
 
             # Otherwise: forward to Teensy via USB
             print(f"Command from GUI: {message}")
             if dev is not None:
+                if message.startswith("PHASE="):
+                    with command_condition:
+                        phase_owner = websocket if message.split("=", 1)[1].strip() != "OFF" else None
                 queue_command(message)
             else:
                 print("USB not connected, ignoring command.")
@@ -527,11 +665,41 @@ async def handler(websocket):
         pass
     finally:
         clients.remove(websocket)
+        with command_condition:
+            if phase_active and phase_owner is websocket:
+                phase_active = False
+                phase_owner = None
+                urgent_commands.appendleft("PHASE=OFF")
+                command_condition.notify_all()
+                if phase_task is not None and not phase_task.done():
+                    phase_task.cancel()
         print("Client disconnected.")
 
-def serial_read_loop(loop):
-    global dev
+def serial_read_loop(loop, outbound_queue):
+    global dev, phase_active, phase_owner
     buffer = bytearray()
+
+    # --- Dedicated persistence writer thread ---
+    persist_queue = queue.Queue(maxsize=2048)
+
+    def _persist_writer():
+        """Drain persist_queue → persister_proc.stdin in a separate thread
+        so blocking flush() never stalls the USB read loop."""
+        while not shutdown_event.is_set():
+            try:
+                line = persist_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if persister_proc and persister_proc.poll() is None:
+                try:
+                    persister_proc.stdin.write(line + "\n")
+                    persister_proc.stdin.flush()
+                except IOError:
+                    pass
+
+    persist_thread = threading.Thread(target=_persist_writer, daemon=True)
+    persist_thread.start()
+
     while not shutdown_event.is_set():
         if dev is not None:
             try:
@@ -548,33 +716,27 @@ def serial_read_loop(loop):
                 time.sleep(0.002)
                 if data:
                     buffer.extend(data)
+                    # Guard against unbounded buffer growth if newlines go missing
+                    if len(buffer) > 4096:
+                        buffer.clear()
+                        continue
                     # Process lines if \n is present
                     while b'\n' in buffer:
                         line, buffer = buffer.split(b'\n', 1)
                         decoded = line.decode('utf-8', errors='ignore').strip()
                         if decoded:
+                            phase_ack = re.fullmatch(r"ACK PHASE = (IDLE|INJECT|PURGE|OFF)", decoded)
+                            if phase_ack:
+                                loop.call_soon_threadsafe(_resolve_phase_ack, phase_ack.group(1))
+                            if decoded == "SYSTEM_WATCHDOG=TRIPPED":
+                                loop.call_soon_threadsafe(_abort_system_after_watchdog)
+                            # Enqueue for persistence (non-blocking)
                             try:
-                                if persister_proc and persister_proc.poll() is None:
-                                    try:
-                                        persister_proc.stdin.write(decoded + "\n")
-                                        persister_proc.stdin.flush()
-                                    except IOError:
-                                        pass
+                                persist_queue.put_nowait(decoded)
+                            except queue.Full:
+                                pass  # drop if persistence can't keep up
 
-                                if decoded.startswith("SHT30 Temp"):
-                                    try:
-                                        # Parse SHT30 Temp  = 25.50 C
-                                        temp_str = decoded.split("=")[1].replace("C", "").strip()
-                                        current_temp = float(temp_str)
-                                        # NOTE: Fuzzy PID has been moved to Teensy firmware.
-                                        # We no longer calculate and send PWR= automatically.
-                                    except Exception as e:
-                                        print(f"SHT30 parse error: {e}")
-
-                            except Exception as e:
-                                print(f"Persistence error: {e}")
-                            if clients:
-                                asyncio.run_coroutine_threadsafe(broadcast_message(decoded), loop)
+                            loop.call_soon_threadsafe(enqueue_serial_message, outbound_queue, decoded)
             except usb.core.USBError as e:
                 # Timeout is normal if no data, error code usually 110
                 if e.errno == 110 or 'timeout' in str(e).lower():
@@ -584,12 +746,14 @@ def serial_read_loop(loop):
                 else:
                     print(f"USB read error: {e}")
                     dev = None
+                    buffer.clear()  # Clear stale bytes to prevent frame contamination on reconnect
                     time.sleep(1)
             except Exception as e:
                 if shutdown_event.is_set():
                     break
                 print(f"USB disconnected or error: {e}")
                 dev = None
+                buffer.clear()  # Clear stale bytes to prevent frame contamination on reconnect
                 time.sleep(1)
         else:
             shutdown_event.wait(3)
@@ -620,14 +784,35 @@ async def kria_power_loop():
             pass
         await asyncio.sleep(1.0)
 
+def enqueue_serial_message(outbound_queue, msg):
+    if outbound_queue.full():
+        try:
+            outbound_queue.get_nowait()  # discard stale telemetry to keep the reader decoupled
+        except asyncio.QueueEmpty:
+            pass
+    try:
+        outbound_queue.put_nowait(msg)
+    except asyncio.QueueFull:
+        pass
+
+async def serial_broadcast_worker(outbound_queue):
+    while not shutdown_event.is_set():
+        msg = await outbound_queue.get()
+        try:
+            await asyncio.wait_for(broadcast_message(msg), timeout=0.5)
+        except asyncio.TimeoutError:
+            pass
+        except Exception as e:
+            print(f"WebSocket broadcast error: {e}")
+
 async def broadcast_message(msg):
     if clients:
-        tasks = [asyncio.create_task(client.send(msg)) for client in clients]
-        await asyncio.wait(tasks)
+        await asyncio.gather(*(client.send(msg) for client in tuple(clients)), return_exceptions=True)
 
 async def main():
     loop = asyncio.get_running_loop()
-    t = threading.Thread(target=serial_read_loop, args=(loop,), daemon=True)
+    outbound_queue = asyncio.Queue(maxsize=512)
+    t = threading.Thread(target=serial_read_loop, args=(loop, outbound_queue), daemon=True)
     writer = threading.Thread(target=usb_write_loop, daemon=True)
     t.start()
     writer.start()
@@ -635,6 +820,8 @@ async def main():
     try:
         print("WebSocket server running on ws://0.0.0.0:8080 (PyUSB mode)")
         asyncio.create_task(kria_power_loop())
+        asyncio.create_task(serial_broadcast_worker(outbound_queue))
+        asyncio.create_task(device_heartbeat_loop())
         async with websockets.serve(handler, "0.0.0.0", 8080):
             await asyncio.Future()
     finally:

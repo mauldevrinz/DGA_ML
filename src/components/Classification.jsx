@@ -71,7 +71,7 @@ const Classification = () => {
             if (csvModeRef.current) {
               csvModeRef.current = false;
               if (json.ok) {
-                setCsvProgress({ progress: 100, message: 'CSV prediction selesai' });
+                setCsvProgress({ progress: 100, message: 'CSV prediction complete' });
                 const gas = Object.entries(json.gas_confidences || {});
                 const gasText = gas.map(([name, value]) => `${name}: ${value}%`).join('\n');
                 const diagnosis = json.iec_diagnosis || {};
@@ -119,8 +119,33 @@ ${json.error || 'Unknown FPGA error'}`);
         return;
       }
 
-      // Parse sensor data from Teensy stream (same format as Acquisition)
-      if (line.match(/ADC\d+\s*=\s*-?\d+/)) {
+      // Parse unified SAMPLE frame from Teensy stream
+      if (typeof line === 'string' && line.startsWith('SAMPLE,')) {
+        const fields = line.trim().split(',');
+        if (fields.length >= 34) {
+          const hasCycleNumber = fields.length === 35 || (
+            fields.length > 35 && Number(fields[1]) >= 0 && Number(fields[1]) <= 100 &&
+            Number(fields[2]) > Number(fields[1])
+          );
+          const requiredValueCount = hasCycleNumber ? 34 : 33;
+          const values = fields.slice(1, 1 + requiredValueCount).map(Number);
+          if (values.length === requiredValueCount && values.every(Number.isFinite)) {
+            const v = values.slice(hasCycleNumber ? 2 : 1);
+            setSensorData(prev => {
+              const next = { ...(prev || {}) };
+              for (let i = 0; i < 16; i++) {
+                next[`mos${i}`] = v[i] * (4.096 / 32768.0) * 1000;
+              }
+              sensorDataRef.current = next;
+              return next;
+            });
+            return;
+          }
+        }
+      }
+
+      // Parse sensor data from Teensy stream (legacy ADC lines fallback)
+      if (typeof line === 'string' && line.match(/ADC\d+\s*=\s*-?\d+/)) {
         const match = line.match(/ADC(\d+)\s*=\s*(-?\d+)/);
         if (match) {
           const adcIndex = parseInt(match[1]);
@@ -226,14 +251,14 @@ ${json.error || 'Unknown FPGA error'}`);
         if (csvWs && csvWs.readyState === WebSocket.OPEN) {
           csvModeRef.current = true;
           csvWs.send(JSON.stringify({ type: 'SNN_CSV_INFER', rows }));
-          showDialog(`CSV dikirim untuk inference: ${rows.length}/288 baris.`);
+          showDialog(`CSV submitted for inference: ${rows.length}/288 rows.`);
           return;
         }
         if (attempt < 10) {
           if (!csvWs || csvWs.readyState === WebSocket.CLOSED) connectWs();
           setTimeout(() => sendCsv(attempt + 1), 500);
         } else {
-          showDialog('Backend WebSocket belum terhubung setelah 5 detik. Periksa port 8080.');
+          showDialog('Backend WebSocket did not connect after 5 seconds. Check port 8080.');
         }
       };
       sendCsv();

@@ -60,17 +60,25 @@ fn pwm_permille_to_turn_off(permille: u16) -> i16 {
 // host, misalnya "SETPOINT=25.5" untuk mengubah target suhu Peltier.
 // ===================================================
 
+    #[derive(Clone, Copy)]
     pub enum HostCmd {
         Setpoint(f32),
         Phase(&'static str),
+        Cycle(u16),
         Pump1Pwm(u16),
         Pwr(i16),
+        Heartbeat,
+        ArmSystem,
     }
 
 struct UsbComm<'a> {
     device: UsbDevice<'a, BusAdapter>,
     serial: SerialPort<'a, BusAdapter>,
     configured: bool,
+    pending_cmds: [Option<HostCmd>; 8],
+    pending_head: usize,
+    pending_len: usize,
+    tx_line_needs_resync: bool,
 }
 
 impl<'a> UsbComm<'a> {
@@ -89,44 +97,70 @@ impl<'a> UsbComm<'a> {
         }
     }
 
-    /// Kirim satu baris teks + newline. Tidak memblokir tanpa batas kalau
-    /// tidak ada host yang membaca (mis. belum dicolok ke PC) - setiap
-    /// gagal-tulis tetap memanggil poll() lalu retry, dan proses lain di
-    /// firmware (sensor, kontrol Peltier) tidak menunggu ini selesai.
-    fn write_line(&mut self, line: &str) {
-        self.poll();
-        let mut bytes = line.as_bytes();
+    /// Write across USB packet boundaries with a finite wait for host polling.
+    /// The short delay lets the next USB frame release a full endpoint without
+    /// allowing a disconnected or stalled host to block the sensor loop forever.
+    fn write_bytes_bounded(&mut self, mut bytes: &[u8]) -> bool {
+        // CDC endpoint payload is 64 bytes. Give the host enough USB frames to
+        // drain a complete telemetry line, while keeping a strict upper bound
+        // on a stalled/disconnected host (about 200 ms at 1 ms per retry).
+        let mut retries = 0u16;
         while !bytes.is_empty() {
             match self.serial.write(bytes) {
-                Ok(0) => self.poll(),
-                Ok(n) => bytes = &bytes[n..],
-                Err(UsbError::WouldBlock) => self.poll(),
-                Err(_) => break,
+                Ok(0) | Err(UsbError::WouldBlock) => {
+                    if retries >= 200 {
+                        return false;
+                    }
+                    self.poll();
+                    cortex_m::asm::delay(60000);
+                    retries += 1;
+                }
+                Ok(n) => {
+                    bytes = &bytes[n..];
+                    retries = 0;
+                }
+                Err(_) => return false,
             }
         }
-        let mut nl: &[u8] = b"\r\n";
-        while !nl.is_empty() {
-            match self.serial.write(nl) {
-                Ok(0) => self.poll(),
-                Ok(n) => nl = &nl[n..],
-                Err(UsbError::WouldBlock) => self.poll(),
-                Err(_) => break,
-            }
+        true
+    }
+
+    /// Retry terbatas menjaga loop sensor tetap berjalan saat host berhenti membaca.
+    fn write_line(&mut self, line: &str) {
+        self.poll();
+        if self.device.state() != UsbDeviceState::Configured {
+            self.tx_line_needs_resync = false;
+            return;
+        }
+        if self.tx_line_needs_resync {
+            if !self.write_bytes_bounded(b"\r\n") { return; }
+            self.tx_line_needs_resync = false;
+        }
+        if !self.write_bytes_bounded(line.as_bytes()) {
+            self.tx_line_needs_resync = true;
+            return;
+        }
+        if !self.write_bytes_bounded(b"\r\n") {
+            self.tx_line_needs_resync = true;
         }
     }
 
-    /// Baca perintah dari host secara non-blocking. Satu-satunya perintah
-    /// yang dikenali saat ini: baris "SETPOINT=<angka>" (mis. "SETPOINT=25.5"),
-    /// dikirim oleh tombol setpoint suhu di web app. Mengembalikan nilai
-    /// baru kalau baris SETPOINT valid baru saja selesai diterima.
+    /// Baca perintah dari host secara non-blocking. Perintah yang datang
+    /// bersamaan disimpan FIFO agar transisi CYCLE/PHASE/PWM tidak terlewat.
     fn poll_cmd(&mut self, rx_buf: &mut [u8], rx_len: &mut usize) -> Option<HostCmd> {
+        if self.pending_len > 0 {
+            let cmd = self.pending_cmds[self.pending_head].take();
+            self.pending_head = (self.pending_head + 1) % self.pending_cmds.len();
+            self.pending_len -= 1;
+            return cmd;
+        }
+
         self.poll();
         let mut chunk = [0u8; 64];
         let n = self.serial.read(&mut chunk).unwrap_or(0);
         if n == 0 {
             return None;
         }
-        let mut result: Option<HostCmd> = None;
         for &b in &chunk[..n] {
             if b == b'\n' || b == b'\r' {
                 if *rx_len > 0 {
@@ -142,15 +176,25 @@ impl<'a> UsbComm<'a> {
                                 "OFF" => Some(HostCmd::Phase("OFF")),
                                 _ => None,
                             }
+                        } else if let Some(rest) = line.strip_prefix("CYCLE=") {
+                            rest.trim().parse::<u16>().ok().map(HostCmd::Cycle)
                         } else if let Some(rest) = line.strip_prefix("PWM=") {
                             rest.trim().parse::<u16>().ok().map(HostCmd::Pump1Pwm)
                         } else if let Some(rest) = line.strip_prefix("PWR=") {
                             rest.trim().parse::<i16>().ok().map(HostCmd::Pwr)
+                        } else if line == "HEARTBEAT" {
+                            Some(HostCmd::Heartbeat)
+                        } else if line == "SYSTEM_ARM" {
+                            Some(HostCmd::ArmSystem)
                         } else {
                             None
                         };
-                        if parsed.is_some() {
-                            result = parsed;
+                        if let Some(cmd) = parsed {
+                            if self.pending_len < self.pending_cmds.len() {
+                                let tail = (self.pending_head + self.pending_len) % self.pending_cmds.len();
+                                self.pending_cmds[tail] = Some(cmd);
+                                self.pending_len += 1;
+                            }
                         }
                     }
                 }
@@ -160,7 +204,14 @@ impl<'a> UsbComm<'a> {
                 *rx_len += 1;
             }
         }
-        result
+        if self.pending_len > 0 {
+            let cmd = self.pending_cmds[self.pending_head].take();
+            self.pending_head = (self.pending_head + 1) % self.pending_cmds.len();
+            self.pending_len -= 1;
+            cmd
+        } else {
+            None
+        }
     }
 }
 
@@ -179,7 +230,7 @@ fn with_usb_comm<R>(f: impl FnOnce(&mut UsbComm<'static>) -> R) -> Option<R> {
 }
 
 macro_rules! process_usb_commands {
-    ($rx_buf:expr, $rx_len:expr, $setpoint:expr, $phase:expr, $pump1_pwm:expr, $pwr_mode:expr, $pwr_val:expr, $set_pump_fn:expr, $p41:expr, $p39:expr, $p40:expr, $p14:expr, $p38:expr) => {
+    ($rx_buf:expr, $rx_len:expr, $setpoint:expr, $phase:expr, $cycle:expr, $pump1_pwm:expr, $pwr_mode:expr, $pwr_val:expr, $heartbeat_missed:expr, $watchdog_tripped:expr, $set_pump_fn:expr, $p41:expr, $p39:expr, $p40:expr, $p14:expr, $p38:expr) => {
         while let Some(cmd) = with_usb_comm(|comm| comm.poll_cmd($rx_buf, $rx_len)).flatten() {
             match cmd {
                 HostCmd::Setpoint(val) => {
@@ -188,11 +239,14 @@ macro_rules! process_usb_commands {
                     usb_println!("ACK SETPOINT = {:.2} C", $setpoint);
                 },
                 HostCmd::Phase(p) => {
-                    $phase = p;
-                    usb_println!("ACK PHASE = {}", p);
+                    if p != "OFF" && $watchdog_tripped {
+                        usb_println!("NACK PHASE = WATCHDOG_LATCHED");
+                    } else {
+                        $phase = p;
+                        usb_println!("ACK PHASE = {}", p);
 
-                    // Handle Phases immediately
-                    match $phase {
+                        // Handle Phases immediately
+                        match $phase {
                         "IDLE" => {
                             let _ = $p41.set_high(); // Pump 3 ON
                             let _ = $p39.set_high(); // SV2
@@ -225,7 +279,12 @@ macro_rules! process_usb_commands {
                             let _ = $p41.set_low();
                             $set_pump_fn(0);
                         }
+                        }
                     }
+                },
+                HostCmd::Cycle(value) => {
+                    $cycle = value;
+                    usb_println!("ACK CYCLE = {}", value);
                 },
                 HostCmd::Pump1Pwm(val) => {
                     let val_permille = (val.min(100) as u16) * 10;
@@ -239,6 +298,19 @@ macro_rules! process_usb_commands {
                     $pwr_mode = true;
                     $pwr_val = val;
                     usb_println!("ACK PWR = {}", val);
+                },
+                HostCmd::Heartbeat => { $heartbeat_missed = 5000; },
+                HostCmd::ArmSystem => {
+                    $phase = "OFF";
+                    let _ = $p14.set_low();
+                    let _ = $p38.set_low();
+                    let _ = $p39.set_low();
+                    let _ = $p40.set_low();
+                    let _ = $p41.set_low();
+                    $set_pump_fn(0);
+                    $watchdog_tripped = false;
+                    $heartbeat_missed = 5000;
+                    usb_println!("ACK SYSTEM_ARMED");
                 }
             }
         }
@@ -253,13 +325,13 @@ fn USB_OTG1() {
 /// Buffer baris tetap (tanpa alokasi heap, cocok untuk no_std) dipakai
 /// untuk memformat teks sebelum dikirim lewat `UsbComm::write_line`.
 struct LineBuf {
-    buf: [u8; 128],
+    buf: [u8; 512],
     len: usize,
 }
 
 impl LineBuf {
     fn new() -> Self {
-        Self { buf: [0; 128], len: 0 }
+        Self { buf: [0; 512], len: 0 }
     }
 
     fn as_str(&self) -> &str {
@@ -297,7 +369,6 @@ macro_rules! usb_println {
 // -- Tuning constants (adjusted for ADS1115 16-bit, 0..32767 single-ended) --
 const NDIR_RAW_EMA_ALPHA:  f32 = 0.25;    // EMA weight for raw ADC channels
 const NDIR_PROC_EMA_ALPHA: f32 = 0.20;    // EMA weight for ratio/response/absorbance
-const NDIR_REF_DIFF_MIN:   u16 = 500;     // min ref_diff for valid ratio (~1.5% of 32767)
 const NDIR_HALF_PERIOD_MS: u32 = 125;     // 4 Hz lamp, 50% duty → 125 ms half-period
 const NDIR_BASELINE_CYCLES: u32 = 80;     // pairs for baseline (~80 s at 1 pair/s loop)
 
@@ -377,8 +448,8 @@ struct NdirHalfSample { act: u16, reference: u16 }
 /// Values produced after one complete ON/OFF lamp pair.
 #[derive(Clone, Copy, Default)]
 struct NdirProcessedSample {
-    _act_diff:       u16,
-    _ref_diff:       u16,
+    _act_diff:       i32,
+    _ref_diff:       i32,
     ratio:          f32,
     baseline_ratio: f32,
     response_pct:   f32,
@@ -409,15 +480,16 @@ impl NdirState {
     }
 
     /// Store OFF-phase sample, compute and return the processed pair.
-    /// Returns None if no ON sample captured or ref_diff < NDIR_REF_DIFF_MIN.
+    /// Returns None if there is no ON sample or the reference delta is zero.
     fn capture_off_and_process(
         &mut self, act_off: u16, ref_off: u16,
     ) -> Option<NdirProcessedSample> {
         let on = self.on_sample.take()?;
-        let act_diff = on.act.abs_diff(act_off);
-        let ref_diff = on.reference.abs_diff(ref_off);
-
-        if ref_diff < NDIR_REF_DIFF_MIN { return None; }
+        // Preserve direction: a negative delta means the OFF reading was
+        // higher than the ON reading. Only a zero denominator is undefined.
+        let act_diff = on.act as i32 - act_off as i32;
+        let ref_diff = on.reference as i32 - ref_off as i32;
+        if ref_diff == 0 { return None; }
 
         let ratio = act_diff as f32 / ref_diff as f32;
 
@@ -435,8 +507,11 @@ impl NdirState {
             });
         }
 
-        let response_pct =
-            ((ratio - self.baseline_ratio) / self.baseline_ratio) * 100.0;
+        let response_pct = if self.baseline_ratio.abs() > f32::EPSILON {
+            ((ratio - self.baseline_ratio) / self.baseline_ratio) * 100.0
+        } else {
+            0.0
+        };
         Some(NdirProcessedSample {
             _act_diff: act_diff, _ref_diff: ref_diff, ratio,
             baseline_ratio: self.baseline_ratio,
@@ -482,8 +557,12 @@ impl NdirProcessedFilter {
 
 /// Beer-Lambert absorbance: A = −ln(ratio / baseline_ratio)
 fn ndir_absorbance(ratio: f32, baseline_ratio: f32) -> f32 {
-    if ratio <= 0.0 || baseline_ratio <= 0.0 { return 0.0; }
-    -ndir_ln_approx(ratio / baseline_ratio)
+    if ratio == 0.0 || baseline_ratio == 0.0 { return 0.0; }
+    let relative_ratio = ratio / baseline_ratio;
+    // Beer-Lambert logarithm is real only for a positive ratio. This still
+    // preserves negative absorbance when relative_ratio is greater than one.
+    if relative_ratio <= 0.0 { return 0.0; }
+    -ndir_ln_approx(relative_ratio)
 }
 
 /// Padé-1 ln approximation with range-reduction.
@@ -689,6 +768,10 @@ fn main() -> ! {
             device,
             serial,
             configured: false,
+            pending_cmds: [None; 8],
+            pending_head: 0,
+            pending_len: 0,
+            tx_line_needs_resync: false,
         });
     });
 
@@ -892,11 +975,13 @@ fn main() -> ! {
     // ===================================================
     let mut setpoint_c: f32 = 25.0;
     #[allow(unused_assignments)]
-    let mut peltier_mode: &str = "OFF";
     let mut fuzzy_pid = FuzzyPid::new(5.0, 0.5, 1.0);
 
     let mut phase_mode: &str = "OFF";
+    let mut cycle_number: u16 = 0;
     let mut pump1_pwm_val: u16 = 500; // default 50%
+    let mut heartbeat_countdown_ms: u16 = 5000;
+    let mut watchdog_tripped = false;
 
     let mut setpoint_rx_buf = [0u8; 48];
     let mut setpoint_rx_len: usize = 0;
@@ -910,10 +995,28 @@ fn main() -> ! {
                 delay.block_ms(1);
                 process_usb_commands!(
                     &mut setpoint_rx_buf, &mut setpoint_rx_len,
-                    setpoint_c, phase_mode, pump1_pwm_val,
+                    setpoint_c, phase_mode, cycle_number, pump1_pwm_val,
                     manual_pwr_mode, manual_pwr_val,
+                    heartbeat_countdown_ms,
+                    watchdog_tripped,
                     set_pump1_pwm, p41, p39, p40, p14, p38
                 );
+                if phase_mode != "OFF" {
+                    heartbeat_countdown_ms = heartbeat_countdown_ms.saturating_sub(1);
+                    if heartbeat_countdown_ms == 0 && !watchdog_tripped {
+                        phase_mode = "OFF";
+                        let _ = p14.set_low();
+                        let _ = p38.set_low();
+                        let _ = p39.set_low();
+                        let _ = p40.set_low();
+                        let _ = p41.set_low();
+                        set_pump1_pwm(0);
+                        watchdog_tripped = true;
+                        usb_println!("SYSTEM_WATCHDOG=TRIPPED");
+                    }
+                } else {
+                    heartbeat_countdown_ms = 5000;
+                }
             }
         }};
     }
@@ -991,7 +1094,6 @@ fn main() -> ! {
     const INA226_ADDR: [u8; 2] = [0x41, 0x40];
 
     const INA226_REG_CONFIG: u8 = 0x00;
-    const INA226_REG_SHUNT: u8 = 0x01;
     const INA226_REG_BUS: u8 = 0x02;
     const INA226_REG_CURRENT: u8 = 0x04;
     const INA226_REG_CALIB: u8 = 0x05;
@@ -1033,7 +1135,6 @@ fn main() -> ! {
 
     const INA226_CAL_VALUE: u16 = 2048;
     const INA226_BUS_LSB: f32 = 0.00125; // 1.25 mV / bit (tetap, sesuai datasheet)
-    const INA226_SHUNT_LSB: f32 = 0.0000025; // 2.5 uV / bit (tetap, sesuai datasheet)
 
     let mut ina226_i2c = i2c1_bus.acquire_i2c();
 
@@ -1185,6 +1286,7 @@ fn main() -> ! {
         nb::block!(adc.read(ch)).unwrap_or(0)
     };
 
+    let mut sample_sequence: u32 = 0;
     loop {
         // NDIR CYCLE — one ON/OFF pair per loop iteration
         // Lamp ON → 125 ms → read ACT/REF → lamp OFF → 125 ms → read ACT/REF → process
@@ -1197,8 +1299,8 @@ fn main() -> ! {
             let mut ndir_response_f: f32 = 0.0;
             let mut _ndir_abs:        f32 = 0.0;
             let mut ndir_abs_f:      f32 = 0.0;
-            let mut ndir_bl_ready:   bool = false;
-            let mut ndir_valid:      bool = false;
+            let mut ndir_valid = false;
+            let mut ndir_bl_ready = false;
 
             if ads_ok[3] {
                 // Run 4 NDIR cycles (125ms ON, 125ms OFF) to make up ~1 second.
@@ -1248,8 +1350,8 @@ fn main() -> ! {
                         ndir_response_f = fp.response_filt;
                         _ndir_abs        = fp.abs_raw;
                         ndir_abs_f      = fp.abs_filt;
-                        ndir_bl_ready   = s.baseline_ready;
-                        ndir_valid      = true;
+                        ndir_valid = true;
+                        ndir_bl_ready = s.baseline_ready;
                     }
                 }
             } else {
@@ -1314,31 +1416,6 @@ fn main() -> ! {
                 mq9       = mox_filters[13].update_i16(read_ads_raw(ChannelSelection::SingleA3));
             }
 
-            // FORMAT UNTUK WEB FRONTEND (ADC0 - ADC15)
-            // Sesuai array GAS_SENSORS di Acquisition.jsx:
-            usb_println!("ADC0 = {}", tgs2600);
-            usb_println!("ADC1 = {}", tgs2611);
-            usb_println!("ADC2 = {}", tgs2610);
-            usb_println!("ADC3 = {}", tgs822);
-            usb_println!("ADC4 = {}", tgs813);
-            usb_println!("ADC5 = {}", mq2);
-            usb_println!("ADC6 = {}", mq6);
-            usb_println!("ADC7 = {}", mq8);
-            usb_println!("ADC8 = {}", mq4);
-            usb_println!("ADC9 = {}", mq3);
-            usb_println!("ADC10 = {}", mq135);
-            usb_println!("ADC11 = {}", mq9);
-            usb_println!("ADC12 = {}", mq7);
-            usb_println!("ADC13 = {}", mq5);
-            usb_println!("ADC14 = {}", ir12emact);
-            usb_println!("NDIR_VALID = {}", ndir_valid as u8);
-            usb_println!("NDIR_BL_READY = {}", ndir_bl_ready as u8);
-            usb_println!("NDIR_RATIO = {:.4}", ndir_ratio_f);
-            usb_println!("NDIR_BASELINE = {:.4}", ndir_baseline);
-            usb_println!("NDIR_RESPONSE = {:.2}", ndir_response_f);
-            usb_println!("NDIR_ABSORBANCE = {:.4}", ndir_abs_f);
-            usb_println!("ADC15 = {}", ir12emref); // Pastikan ini selalu dicetak paling akhir untuk trigger frontend
-
             // SHT30-D read
             let mut sht30_temp = 0.0;
             let mut sht30_hum = 0.0;
@@ -1367,26 +1444,20 @@ fn main() -> ! {
                 Err(_) => usb_println!("SHT30: I2C Write failed at 0x44 (No ACK)"),
             }
 
-            usb_println!("SHT30 Temp  = {:.2} C", sht30_temp);
-            usb_println!("SHT30 Humi  = {:.2} %RH", sht30_hum);
-
             // KONTROL PELTIER - menggunakan Fuzzy PID
+            let mut peltier_mode: &str = "OFF";
             if manual_pwr_mode {
                 set_peltier_power(manual_pwr_val);
                 peltier_mode = "MANUAL";
             } else if setpoint_c > 0.0 {
                 let pwr = fuzzy_pid.compute(setpoint_c, sht30_temp, 1.0);
                 set_peltier_power(pwr);
+                peltier_mode = if pwr > 0 { "COOL" } else if pwr < 0 { "HEAT" } else { "IDLE" };
                 if pwr > 0 {
-                    peltier_mode = "COOL";
                 } else if pwr < 0 {
-                    peltier_mode = "HEAT";
-                } else {
-                    peltier_mode = "IDLE";
                 }
             } else {
                 set_peltier_power(0);
-                peltier_mode = "OFF";
             }
 
             // SHT31 read (bus i2c1, pin 16/17)
@@ -1411,9 +1482,6 @@ fn main() -> ! {
                 Err(_) => usb_println!("SHT31: I2C Write failed at {:#x} (No ACK)", SHT31_ADDR),
             }
 
-            usb_println!("SHT31 Temp  = {:.2} C", sht31_temp);
-            usb_println!("SHT31 Humi  = {:.2} %RH", sht31_hum);
-
             // SAFETY LOGIC (Datasheet Limits: Min -10C, Max 50C)
             // Margin -> Min Safe: 5.0C, Max Safe: 45.0C
             if sht31_temp >= 45.0 || sht30_temp >= 45.0 {
@@ -1435,26 +1503,19 @@ fn main() -> ! {
                 let _ = p15.set_high(); // Fan ON
             }
 
-            usb_println!("SETPOINT = {:.2} C", setpoint_c);
-            usb_println!("PELTIER_MODE = {}", peltier_mode);
-
             // INA226 read (bus i2c1, 2x sensor arus)
+            let mut ina_vbus = [0.0f32; 2];
+            let mut ina_current_ma = [0.0f32; 2];
+            let mut ina_power = [0.0f32; 2];
             for i in 0..2 {
                 if !ina226_ok[i] {
-                    usb_println!(
-                        "INA226_{} (addr {:#x}): ERROR (kalibrasi/I2C gagal, lewati)",
-                        i + 1,
-                        INA226_ADDR[i]
-                    );
                     continue;
                 }
                 let addr = INA226_ADDR[i];
                 let bus_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_BUS);
-                let shunt_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_SHUNT) as i16;
                 let current_raw = ina226_read(&mut ina226_i2c, addr, INA226_REG_CURRENT) as i16;
 
                 let bus_voltage = bus_raw as f32 * INA226_BUS_LSB;
-                let shunt_voltage = shunt_raw as f32 * INA226_SHUNT_LSB;
                 let current_uncalibrated = current_raw as f32 * INA226_CURRENT_LSB;
                 // Kalibrasi 2-titik: gain dulu, baru offset ditambahkan
                 // (lihat catatan di deklarasi INA226_CURRENT_GAIN/OFFSET_A di atas).
@@ -1468,15 +1529,10 @@ fn main() -> ! {
                 // Hitung power secara manual menggunakan arus yang sudah dikalibrasi
                 // karena power_raw dari IC belum memperhitungkan offset software ini
                 let power = current * bus_voltage;
+                ina_vbus[i] = bus_voltage;
+                ina_current_ma[i] = current * 1000.0;
+                ina_power[i] = power;
 
-                usb_println!(
-                    "INA226_{} Vbus = {:.3} V, Vshunt = {:.5} V, I = {:.4} A, P = {:.4} W",
-                    i + 1,
-                    bus_voltage,
-                    shunt_voltage,
-                    current,
-                    power
-                );
             }
 
             // ===================================================
@@ -1515,7 +1571,26 @@ fn main() -> ! {
                 // EMA filter
                 flow_lpm = flow_ema.update(flow_lpm);
             }
-            usb_println!("FLOW_INLET = {:.2}", flow_lpm);
+            // One complete, ordered frame per acquisition loop. Keeping the
+            // stream to one line avoids interleaving/truncation from dozens of
+            // legacy text writes every sensor cycle.
+            sample_sequence = sample_sequence.wrapping_add(1);
+            usb_println!(
+                "SAMPLE,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{}",
+                cycle_number, sample_sequence,
+                tgs2600, tgs2611, tgs2610, tgs822, tgs813,
+                mq2, mq6, mq8, mq4, mq3, mq135, mq9, mq7, mq5,
+                ir12emact, ir12emref,
+                ndir_ratio_f, ndir_baseline, ndir_response_f, ndir_abs_f,
+                sht30_temp, sht31_temp, sht30_hum, sht31_hum,
+                flow_lpm,
+                ina_vbus[0], ina_current_ma[0], ina_power[0],
+                ina_vbus[1], ina_current_ma[1], ina_power[1],
+                setpoint_c,
+                peltier_mode,
+                ndir_valid as u8,
+                ndir_bl_ready as u8
+            );
     }
 }
 

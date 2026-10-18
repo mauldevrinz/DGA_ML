@@ -21,6 +21,60 @@ const GAS_COLORS = [
   '#721CC8', '#CC36E2', '#C81C9D', '#E23676'
 ];
 
+const crc32 = (bytes) => {
+  let crc = 0xFFFFFFFF;
+  for (const byte of bytes) {
+    crc ^= byte;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xEDB88320 : 0);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+};
+
+const makeZipBlob = (files) => {
+  const encoder = new TextEncoder();
+  const localParts = [];
+  const centralParts = [];
+  let localOffset = 0;
+  files.forEach(({ name, content }) => {
+    const filename = encoder.encode(name);
+    const data = typeof content === 'string' ? encoder.encode(content) : content;
+    const checksum = crc32(data);
+    const local = new Uint8Array(30 + filename.length);
+    const localView = new DataView(local.buffer);
+    localView.setUint32(0, 0x04034B50, true);
+    localView.setUint16(4, 20, true);
+    localView.setUint32(14, checksum, true);
+    localView.setUint32(18, data.length, true);
+    localView.setUint32(22, data.length, true);
+    localView.setUint16(26, filename.length, true);
+    local.set(filename, 30);
+    localParts.push(local, data);
+
+    const central = new Uint8Array(46 + filename.length);
+    const view = new DataView(central.buffer);
+    view.setUint32(0, 0x02014B50, true);
+    view.setUint16(4, 20, true);
+    view.setUint16(6, 20, true);
+    view.setUint32(16, checksum, true);
+    view.setUint32(20, data.length, true);
+    view.setUint32(24, data.length, true);
+    view.setUint16(28, filename.length, true);
+    view.setUint32(42, localOffset, true);
+    central.set(filename, 46);
+    centralParts.push(central);
+    localOffset += local.length + data.length;
+  });
+  const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
+  const end = new Uint8Array(22);
+  const endView = new DataView(end.buffer);
+  endView.setUint32(0, 0x06054B50, true);
+  endView.setUint16(8, files.length, true);
+  endView.setUint16(10, files.length, true);
+  endView.setUint32(12, centralSize, true);
+  endView.setUint32(16, localOffset, true);
+  return new Blob([...localParts, ...centralParts, end], { type: 'application/zip' });
+};
+
 // Reusable small chart component
 const MiniChart = React.memo(({ title, dataKey, color, domain, unit, dataHistory, latestData }) => {
   const latestVal = latestData && latestData[dataKey] !== undefined ? latestData[dataKey] : 0;
@@ -72,7 +126,11 @@ MiniChart.propTypes = {
 
 const Acquisition = ({ isConnected, setIsConnected }) => {
   const [dataHistory, setDataHistory] = useState([]);
+  const [frameDiagnostics, setFrameDiagnostics] = useState({ missing: 0, malformed: 0, nonNumeric: 0, malformedLengths: {}, duplicates: 0, resets: 0 });
+  const frameDiagnosticsRef = useRef({ lastSequence: null, missing: 0, malformed: 0, nonNumeric: 0, malformedLengths: {}, duplicates: 0, resets: 0 });
+  const [safetyWarning, setSafetyWarning] = useState(null);
   const [viewMode, setViewMode] = useLocalStorage('dga_viewMode', 'grid');
+  const [combinedChartMode, setCombinedChartMode] = useLocalStorage('dga_combinedChartMode', 'gas');
   
   // Serial Port states
   const [serialPort, setSerialPort] = useState(null);
@@ -96,10 +154,33 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   const [recordingStartTime, setRecordingStartTime] = useState(null);
   const [recordingElapsed, setRecordingElapsed] = useState(0);
   const [sessionData, setSessionData] = useState([]); // data captured during this recording session
+  const sessionDataRef = useRef([]);
+  const cycleDataRef = useRef([]);
+  const currentCycleIndexRef = useRef(0);
+  const [completedCycleCount, setCompletedCycleCount] = useState(0);
+  const latestDataRef = useRef(null);
   const [baselines, setBaselines] = useState({}); // Stores R0 for normalization
   const [saveGraphStatus, setSaveGraphStatus] = useState(''); // Status message for save graph
   const recordingRef = useRef(false); // ref to avoid stale closure in the data capture effect
-  const dataSnapshotIndexRef = useRef(0); // tracks how much of dataHistory we've already captured
+
+  const appendSessionSample = useCallback((sample) => {
+    const point = { ...sample, time: sessionDataRef.current.length + 1 };
+    sessionDataRef.current.push(point);
+    setSessionData(prev => {
+      const next = [...prev, point];
+      return next.length > 600 ? next.slice(-600) : next;
+    });
+    const frameCycleIndex = Number(sample.cycle_number) - 1;
+    let cycleRows = null;
+    if (frameCycleIndex >= 0 && frameCycleIndex < cycleDataRef.current.length) {
+      cycleRows = cycleDataRef.current[frameCycleIndex];
+    } else if (currentCycleIndexRef.current >= 0 && currentCycleIndexRef.current < cycleDataRef.current.length) {
+      cycleRows = cycleDataRef.current[currentCycleIndexRef.current];
+    } else if (cycleDataRef.current.length > 0) {
+      cycleRows = cycleDataRef.current[0];
+    }
+    if (cycleRows) cycleRows.push({ ...sample, time: cycleRows.length + 1 });
+  }, []);
   
 
   // ===== SYSTEM PHASE SETTINGS POPUP =====
@@ -108,13 +189,15 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   const [injectDuration, setInjectDuration] = useLocalStorage('dga_injectDuration', 5); // minutes
   const [purgeDuration, setPurgeDuration] = useLocalStorage('dga_purgeDuration', 4);  // minutes
   const [pump1Pwm, setPump1Pwm] = useLocalStorage('dga_pump1Pwm', 50); // percentage 0-100
+  const [cycleCount, setCycleCount] = useLocalStorage('dga_cycleCount', 1);
 
   // ===== SYSTEM RUN STATE =====
   const [systemRunning, setSystemRunning] = useState(false);
+  const systemRunningRef = useRef(false);
   const [currentPhase, setCurrentPhase] = useState(''); // 'IDLE' | 'INJECT' | 'PURGE' | ''
+  const [phaseReady, setPhaseReady] = useState(false);
   const [phaseTimeLeft, setPhaseTimeLeft] = useState(0); // seconds remaining in current phase
   const systemTimerRef = useRef(null);
-  const phaseQueueRef = useRef([]); // queue of {phase, durationSec}
   const phaseStartTimeRef = useRef(null);
   const phaseDurationRef = useRef(0);
 
@@ -142,14 +225,148 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         flow_inlet: 0.0,
       };
       let lastUpdateTime = 0;
+      let sawSampleFrames = false;
       
       ws.onmessage = (event) => {
         const line = event.data;
 
+        if (typeof line === 'string' && line.startsWith('SAMPLE,')) {
+          const fields = line.trim().split(',');
+          // New frames include cycle + sequence. Older firmware sends only sequence.
+          // Both carry 16 ADC + 4 NDIR + 4 climate + flow + 6 INA + setpoint.
+          // Firmware currently emits cycle + sequence + 32 values. Accept
+          // trailing fields so an added firmware diagnostic won't drop samples.
+          if (fields.length >= 34) {
+            const hasCycleNumber = fields.length === 35 || (
+              fields.length > 35 && Number(fields[1]) >= 0 && Number(fields[1]) <= 100 &&
+              Number(fields[2]) > Number(fields[1])
+            );
+            const requiredValueCount = hasCycleNumber ? 34 : 33;
+            const values = fields.slice(1, 1 + requiredValueCount).map(Number);
+            if (values.length === requiredValueCount && values.every(Number.isFinite)) {
+              // Keep the legacy ADC parser active until one complete SAMPLE
+              // frame is actually accepted, so truncated frames cannot blank the UI.
+              const cycleNumber = hasCycleNumber
+                ? values[0]
+                : Math.max(0, currentCycleIndexRef.current + 1);
+              const sequence = hasCycleNumber ? values[1] : values[0];
+              const v = values.slice(hasCycleNumber ? 2 : 1);
+              sawSampleFrames = true;
+              const diag = frameDiagnosticsRef.current;
+              const seq = Math.trunc(sequence);
+              if (diag.lastSequence !== null) {
+                if (seq === diag.lastSequence) {
+                  diag.duplicates += 1;
+                  setFrameDiagnostics({ ...diag });
+                  return;
+                }
+                if (seq > diag.lastSequence + 1) diag.missing += seq - diag.lastSequence - 1;
+                if (seq < diag.lastSequence) diag.resets += 1;
+              }
+              diag.lastSequence = seq;
+              setFrameDiagnostics({ ...diag });
+              const sample = {
+                // KRIA telemetry arrives as a separate backend message. Carry
+                // its latest values forward when the next Teensy SAMPLE frame
+                // becomes the new chart/session point.
+                ...(latestDataRef.current || {}),
+                cycle_number: cycleNumber,
+                sample_sequence: sequence,
+                time: sequence,
+                ...Object.fromEntries(v.slice(0, 16).map((value, i) => [`mos${i}`, value * (4.096 / 32768.0) * 1000])),
+                ndir_ratio: v[16], ndir_baseline: v[17], ndir_resp: v[18], ndir_abs: v[19],
+                temp0: v[20], temp1: v[21], hum0: v[22], hum1: v[23], flow_inlet: v[24],
+                ina1_v: v[25], ina1_i: v[26], ina1_p: v[27],
+                ina2_v: v[28], ina2_i: v[29], ina2_p: v[30], setpoint_c: v[31],
+                peltier_mode: fields.length > 35 ? fields[35] : undefined,
+                ndir_valid: fields.length > 36 ? Number(fields[36]) === 1 : undefined,
+                ndir_baseline_ready: fields.length > 37 ? Number(fields[37]) === 1 : undefined,
+              };
+              latestDataRef.current = sample;
+              setDataHistory(prev => {
+                const next = [...prev, sample];
+                return next.length > 600 ? next.slice(-600) : next;
+              });
+              if (recordingRef.current) appendSessionSample(sample);
+            } else {
+              const diagnostics = frameDiagnosticsRef.current;
+              diagnostics.malformed += 1;
+              diagnostics.nonNumeric += 1;
+              setFrameDiagnostics({ ...frameDiagnosticsRef.current });
+              console.warn('Ignoring invalid Teensy SAMPLE frame: non-numeric field');
+            }
+          } else {
+            const diagnostics = frameDiagnosticsRef.current;
+            diagnostics.malformed += 1;
+            diagnostics.malformedLengths[fields.length] = (diagnostics.malformedLengths[fields.length] || 0) + 1;
+            setFrameDiagnostics({ ...diagnostics, malformedLengths: { ...diagnostics.malformedLengths } });
+            console.warn(`Ignoring invalid Teensy SAMPLE frame: expected at least 34 fields, received ${fields.length}`);
+          }
+          // A bad SAMPLE line should not disable the older ADC-line fallback.
+          return;
+        }
+
+        if (typeof line === 'string') {
+          if (line.includes('SYSTEM_WATCHDOG=TRIPPED')) {
+            systemRunningRef.current = false;
+            setSystemRunning(false);
+            setPhaseReady(false);
+            setCurrentPhase('');
+            setPhaseTimeLeft(0);
+            setIsRecording(false);
+            recordingRef.current = false;
+            setRecordingStartTime(null);
+            setCompletedCycleCount(cycleDataRef.current.filter(rows => rows.length > 0).length);
+            localStorage.setItem('dga_acquisition_active', 'false');
+            setSafetyWarning('The Teensy safety watchdog expired. The pump and valves have been turned off; check the Kria-to-Teensy connection before restarting.');
+            setShowSavePopup(true);
+          }
+          const ack = line.match(/^ACK PHASE = /);
+          if (ack) return;
+        }
+
         if (typeof line === 'string' && line.trimStart().startsWith('{')) {
           try {
             const json = JSON.parse(line);
-            if (saveGraphPendingRef.current) {
+            if (json.type === 'SYSTEM_PHASE') {
+              currentCycleIndexRef.current = Math.max(0, Number(json.cycle) - 1);
+              phaseStartTimeRef.current = Date.now();
+              phaseDurationRef.current = Number(json.duration_sec) || 0;
+              setCurrentPhase(json.phase || '');
+              setPhaseTimeLeft(phaseDurationRef.current);
+              setPhaseReady(true);
+              return;
+            }
+            if (json.type === 'SYSTEM_COMPLETE' || json.type === 'SYSTEM_STOPPED') {
+              systemRunningRef.current = false;
+              setSystemRunning(false);
+              setPhaseReady(false);
+              setCurrentPhase('');
+              setPhaseTimeLeft(0);
+              setIsRecording(false);
+              recordingRef.current = false;
+              setRecordingStartTime(null);
+              setCompletedCycleCount(cycleDataRef.current.filter(rows => rows.length > 0).length);
+              localStorage.setItem('dga_acquisition_active', 'false');
+              setShowSavePopup(true);
+              return;
+            }
+            if (json.type === 'SYSTEM_ERROR') {
+              systemRunningRef.current = false;
+              setSystemRunning(false);
+              setPhaseReady(false);
+              setCurrentPhase('');
+              setPhaseTimeLeft(0);
+              setIsRecording(false);
+              recordingRef.current = false;
+              setRecordingStartTime(null);
+              setCompletedCycleCount(cycleDataRef.current.filter(rows => rows.length > 0).length);
+              localStorage.setItem('dga_acquisition_active', 'false');
+              setSafetyWarning(json.message || 'The backend could not continue the system plan.');
+              setShowSavePopup(true);
+              return;
+            }
+            if (saveGraphPendingRef.current && json.ok !== undefined) {
               saveGraphPendingRef.current.resolve(json);
               saveGraphPendingRef.current = null;
             }
@@ -252,28 +469,82 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           updated = true;
         }
         
-        const matchKria = line.match(/KRIA Vbus=([0-9.]+)V I=([0-9.]+)A P=([0-9.]+)W/);
+        const matchKria = line.match(/KRIA Vbus=(-?[0-9.]+)V I=(-?[0-9.]+)A P=(-?[0-9.]+)W/);
         if (matchKria) {
-          currentData.kria_v = parseFloat(matchKria[1]);
-          currentData.kria_i = parseFloat(matchKria[2]) * 1000;
-          currentData.kria_p = parseFloat(matchKria[3]);
+          const kriaUpdate = {
+            kria_v: parseFloat(matchKria[1]),
+            kria_i: parseFloat(matchKria[2]) * 1000,
+            kria_p: parseFloat(matchKria[3]),
+          };
+          Object.assign(currentData, kriaUpdate);
+          latestDataRef.current = { ...(latestDataRef.current || {}), ...kriaUpdate };
+          setDataHistory(prev => {
+            if (prev.length === 0) return prev;
+            const next = [...prev];
+            next[next.length - 1] = { ...next[next.length - 1], ...kriaUpdate };
+            return next;
+          });
+          if (recordingRef.current) {
+            const lastSessionIndex = sessionDataRef.current.length - 1;
+            if (lastSessionIndex >= 0) {
+              sessionDataRef.current[lastSessionIndex] = { ...sessionDataRef.current[lastSessionIndex], ...kriaUpdate };
+              setSessionData(prev => {
+                const next = [...prev];
+                const visibleIndex = next.findIndex(row => row.time === sessionDataRef.current[lastSessionIndex].time);
+                if (visibleIndex >= 0) next[visibleIndex] = { ...next[visibleIndex], ...kriaUpdate };
+                return next;
+              });
+            }
+            const cycleRows = cycleDataRef.current[currentCycleIndexRef.current];
+            if (cycleRows?.length) {
+              cycleRows[cycleRows.length - 1] = { ...cycleRows[cycleRows.length - 1], ...kriaUpdate };
+            }
+          }
           updated = true;
         }
         
-        if (updated && currentData.mos15 !== undefined) {
+        if (!sawSampleFrames && updated && currentData.mos15 !== undefined) {
            const now = Date.now();
            if (now - lastUpdateTime >= 1000) {
              lastUpdateTime = now;
              setDataHistory(prev => {
                 currentData.time = prev.length > 0 ? prev[prev.length - 1].time + 1 : 1;
-                return [...prev, { ...currentData }];
+                const snapshot = { ...currentData };
+                latestDataRef.current = snapshot;
+                const next = [...prev, snapshot];
+                return next.length > 600 ? next.slice(-600) : next;
              });
+             if (recordingRef.current) {
+               const legacyCycleNumber = Math.max(1, currentCycleIndexRef.current + 1);
+               const legacySample = {
+                 cycle_number: legacyCycleNumber,
+                 sample_sequence: sessionDataRef.current.length + 1,
+                 ...currentData,
+               };
+               appendSessionSample(legacySample);
+             }
+           } else {
+             latestDataRef.current = { ...currentData };
            }
            currentData = { ...currentData, time: 0 };
         }
       };
 
       ws.onclose = () => {
+        if (systemRunningRef.current) {
+          systemRunningRef.current = false;
+          setSystemRunning(false);
+          setPhaseReady(false);
+          setCurrentPhase('');
+          setPhaseTimeLeft(0);
+          setIsRecording(false);
+          recordingRef.current = false;
+          setRecordingStartTime(null);
+          setCompletedCycleCount(cycleDataRef.current.filter(rows => rows.length > 0).length);
+          localStorage.setItem('dga_acquisition_active', 'false');
+          setSafetyWarning('The backend connection was lost while a cycle was running. The Teensy watchdog will turn off the actuators; session data already received can still be saved.');
+          setShowSavePopup(true);
+        }
         setIsConnected(false);
         setSerialPort(null);
         serialPortRef.current = null;
@@ -342,17 +613,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     }
   }, [serialPort, setpointInput, chamberKp, chamberKi, chamberKd]);
 
-  // --- Recording logic: capture new dataHistory entries into sessionData ---
-  useEffect(() => {
-    if (!recordingRef.current) return;
-    // Append any new data points that arrived since last snapshot
-    if (dataHistory.length > dataSnapshotIndexRef.current) {
-      const newPoints = dataHistory.slice(dataSnapshotIndexRef.current);
-      setSessionData(prev => [...prev, ...newPoints]);
-      dataSnapshotIndexRef.current = dataHistory.length;
-    }
-  }, [dataHistory]);
-
   // --- Elapsed timer ---
   useEffect(() => {
     if (!isRecording || !recordingStartTime) return;
@@ -362,56 +622,18 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     return () => clearInterval(interval);
   }, [isRecording, recordingStartTime]);
 
-  // ===== SYSTEM PHASE EXECUTION ENGINE =====
-  const startNextPhase = useCallback(() => {
-    const queue = phaseQueueRef.current;
-    if (queue.length === 0) {
-      // All phases done — send OFF to teensy, stop recording, show save popup
-      sendCommand('PHASE=OFF');
-      setCurrentPhase('');
-      setPhaseTimeLeft(0);
-      setSystemRunning(false);
-      localStorage.setItem("dga_acquisition_active", "false");
-      // Stop recording
-      setIsRecording(false);
-      recordingRef.current = false;
-      setRecordingStartTime(null);
-      // Show save popup
-      setShowSavePopup(true);
-      return;
-    }
-
-    const next = queue.shift();
-    setCurrentPhase(next.phase);
-    phaseDurationRef.current = next.durationSec;
-    phaseStartTimeRef.current = Date.now();
-    setPhaseTimeLeft(next.durationSec);
-
-    // Send phase command to teensy
-    sendCommand(`PHASE=${next.phase}`);
-    // Also send PWM for inject phase
-    if (next.phase === 'INJECT') {
-      sendCommand(`PWM=${pump1Pwm}`);
-    }
-  }, [sendCommand, pump1Pwm]);
-
-  // Phase countdown timer
+  // Display the phase countdown; phase transitions are scheduled by the Kria backend.
   useEffect(() => {
-    if (!systemRunning || !currentPhase) return;
+    if (!systemRunning || !currentPhase || !phaseReady) return;
 
     const interval = setInterval(() => {
       const elapsed = (Date.now() - phaseStartTimeRef.current) / 1000;
       const remaining = Math.max(0, phaseDurationRef.current - elapsed);
       setPhaseTimeLeft(Math.ceil(remaining));
-
-      if (remaining <= 0) {
-        clearInterval(interval);
-        startNextPhase();
-      }
     }, 500);
 
     return () => clearInterval(interval);
-  }, [systemRunning, currentPhase, startNextPhase]);
+  }, [systemRunning, currentPhase, phaseReady]);
 
   // --- Handle "Start System" button click → show popup ---
   const handleStartSystemClick = useCallback(() => {
@@ -427,8 +649,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     if (systemRunning) {
       // STOP the running system
       if (systemTimerRef.current) clearInterval(systemTimerRef.current);
-      phaseQueueRef.current = [];
-      sendCommand('PHASE=OFF');
+      systemRunningRef.current = false;
+      setPhaseReady(false);
+      serialPortRef.current?.send(JSON.stringify({ type: 'STOP_SYSTEM' }));
       setCurrentPhase('');
       setPhaseTimeLeft(0);
       setSystemRunning(false);
@@ -437,6 +660,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       setIsRecording(false);
       recordingRef.current = false;
       setRecordingStartTime(null);
+      setCompletedCycleCount(cycleDataRef.current.filter(rows => rows.length > 0).length);
       // Show save popup if we have data
       if (recordingRef.current === false) {
         // Use a timeout to allow sessionData state to settle
@@ -447,7 +671,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
     // Show the settings popup
     setShowSystemPopup(true);
-  }, [isConnected, sessionName, systemRunning, sendCommand]);
+  }, [isConnected, sessionName, systemRunning]);
 
   // --- Actually start the system (called from popup "Start" button) ---
   const handleConfirmStart = useCallback(() => {
@@ -455,25 +679,23 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
 
     // Build phase queue
     const queue = [];
-    if (idleDuration > 0) {
-      queue.push({ phase: 'IDLE', durationSec: idleDuration * 60 });
-    }
-    if (injectDuration > 0) {
-      queue.push({ phase: 'INJECT', durationSec: injectDuration * 60 });
-    }
-    if (purgeDuration > 0) {
-      queue.push({ phase: 'PURGE', durationSec: purgeDuration * 60 });
+    const requestedCycles = Math.max(1, Math.floor(Number(cycleCount) || 1));
+    for (let cycleIndex = 0; cycleIndex < requestedCycles; cycleIndex += 1) {
+      if (idleDuration > 0) {
+        queue.push({ phase: 'IDLE', durationSec: idleDuration * 60, cycleIndex });
+      }
+      if (injectDuration > 0) {
+        queue.push({ phase: 'INJECT', durationSec: injectDuration * 60, cycleIndex });
+      }
+      if (purgeDuration > 0) {
+        queue.push({ phase: 'PURGE', durationSec: purgeDuration * 60, cycleIndex });
+      }
     }
 
     if (queue.length === 0) {
       alert('All phase durations are 0. Please set at least one phase duration.');
       return;
     }
-
-    phaseQueueRef.current = queue;
-
-    // Send PWM setting to Teensy
-    sendCommand(`PWM=${pump1Pwm}`);
 
     // Capture baseline (R0) from the latest available data point
     const currentLatest = dataHistory.length > 0 ? dataHistory[dataHistory.length - 1] : null;
@@ -486,22 +708,55 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
     setBaselines(newBaselines);
 
     // Start recording
+    sessionDataRef.current = [];
+    cycleDataRef.current = Array.from({ length: requestedCycles }, () => []);
+    currentCycleIndexRef.current = 0;
+    setCompletedCycleCount(0);
+    frameDiagnosticsRef.current = { lastSequence: null, missing: 0, malformed: 0, nonNumeric: 0, malformedLengths: {}, duplicates: 0, resets: 0 };
+    setFrameDiagnostics({ missing: 0, malformed: 0, nonNumeric: 0, malformedLengths: {}, duplicates: 0, resets: 0 });
     setSessionData([]);
-    dataSnapshotIndexRef.current = dataHistory.length;
     setRecordingStartTime(Date.now());
     setRecordingElapsed(0);
     setIsRecording(true);
     recordingRef.current = true;
 
-    // Start system
-    setSystemRunning(true);
-    localStorage.setItem("dga_acquisition_active", "true");
-    startNextPhase();
-  }, [idleDuration, injectDuration, purgeDuration, pump1Pwm, sendCommand, dataHistory.length, startNextPhase]);
+    // The Kria backend schedules every phase and keeps the Teensy heartbeat alive.
+    try {
+      const socket = serialPortRef.current;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        throw new Error('The backend connection is not open. Reconnect the stream and try again.');
+      }
+      socket.send(JSON.stringify({
+        type: 'START_SYSTEM_PLAN',
+        pump_pwm: Number(pump1Pwm),
+        phases: queue.map(({ phase, durationSec, cycleIndex }) => ({
+          phase,
+          duration_sec: durationSec,
+          cycle: cycleIndex + 1,
+        })),
+      }));
+      systemRunningRef.current = true;
+      setSystemRunning(true);
+      localStorage.setItem("dga_acquisition_active", "true");
+    } catch (error) {
+      systemRunningRef.current = false;
+      setSystemRunning(false);
+      setPhaseReady(false);
+      setIsRecording(false);
+      recordingRef.current = false;
+      setRecordingStartTime(null);
+      localStorage.setItem('dga_acquisition_active', 'false');
+      setSafetyWarning(error.message || 'Could not start the system run.');
+      setShowSavePopup(true);
+    }
+  }, [idleDuration, injectDuration, purgeDuration, pump1Pwm, cycleCount, dataHistory]);
 
   // --- Save Data as CSV ---
   const handleSaveData = useCallback(() => {
-    if (sessionData.length === 0) {
+    const cycles = cycleDataRef.current
+      .map((rows, index) => ({ rows, cycleNumber: index + 1 }))
+      .filter(cycle => cycle.rows.length > 0);
+    if (cycles.length === 0) {
       alert('No data to save. Start a recording session and collect some data first.');
       return;
     }
@@ -514,50 +769,47 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       'ina226_1_vbus_V', 'ina226_1_current_mA', 'ina226_1_power_W',
       'ina226_2_vbus_V', 'ina226_2_current_mA', 'ina226_2_power_W',
       'kria_vbus_V', 'kria_current_mA', 'kria_power_W',
+      'setpoint_C', 'peltier_mode',
       'ndir_ratio', 'ndir_baseline', 'ndir_response_pct', 'ndir_absorbance_au',
+      'ndir_valid', 'ndir_baseline_ready',
       'flow_inlet'
     ];
-    const csvRows = [headers.join(',')];
-
-    for (const point of sessionData) {
-      const row = [
-        point.time ?? '',
-        ...GAS_SENSORS.map((_, i) => (point[`mos${i}`] ?? '').toString()),
-        (point.temp0 ?? '').toString(),
-        (point.temp1 ?? '').toString(),
-        (point.hum0 ?? '').toString(),
-        (point.hum1 ?? '').toString(),
-        (point.ina1_v ?? '').toString(),
-        (point.ina1_i ?? '').toString(),
-        (point.ina1_p ?? '').toString(),
-        (point.ina2_v ?? '').toString(),
-        (point.ina2_i ?? '').toString(),
-        (point.ina2_p ?? '').toString(),
-        (point.kria_v ?? '').toString(),
-        (point.kria_i ?? '').toString(),
-        (point.kria_p ?? '').toString(),
-        (point.ndir_ratio ?? '').toString(),
-        (point.ndir_baseline ?? '').toString(),
-        (point.ndir_resp ?? '').toString(),
-        (point.ndir_abs ?? '').toString(),
-        (point.flow_inlet ?? '').toString(),
-      ];
-      csvRows.push(row.join(','));
-    }
-
-    const csvString = csvRows.join('\n');
-    const blob = new Blob([csvString], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
     const safeName = sessionName.trim().replace(/[^a-zA-Z0-9_-]/g, '_') || 'session';
+    const csvFiles = cycles.map(({ rows, cycleNumber }) => {
+      const csvRows = [headers.join(',')];
+      for (const point of rows) {
+        csvRows.push([
+          point.time ?? '',
+          ...GAS_SENSORS.map((_, i) => (point[`mos${i}`] ?? '').toString()),
+          (point.temp0 ?? '').toString(), (point.temp1 ?? '').toString(),
+          (point.hum0 ?? '').toString(), (point.hum1 ?? '').toString(),
+          (point.ina1_v ?? '').toString(), (point.ina1_i ?? '').toString(),
+          (point.ina1_p ?? '').toString(), (point.ina2_v ?? '').toString(),
+          (point.ina2_i ?? '').toString(), (point.ina2_p ?? '').toString(),
+          (point.kria_v ?? '').toString(), (point.kria_i ?? '').toString(),
+          (point.kria_p ?? '').toString(), (point.setpoint_c ?? '').toString(),
+          (point.peltier_mode ?? '').toString(), (point.ndir_ratio ?? '').toString(),
+          (point.ndir_baseline ?? '').toString(), (point.ndir_resp ?? '').toString(),
+          (point.ndir_abs ?? '').toString(), (point.ndir_valid ?? '').toString(),
+          (point.ndir_baseline_ready ?? '').toString(), (point.flow_inlet ?? '').toString(),
+        ].join(','));
+      }
+      return {
+        name: `DGA_${safeName}_${faultLabel}_cycle_${String(cycleNumber).padStart(2, '0')}_${timestamp}.csv`,
+        content: csvRows.join('\n'),
+      };
+    });
+    const blob = makeZipBlob(csvFiles);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
     a.href = url;
-    a.download = `DGA_${safeName}_${faultLabel}_${timestamp}.csv`;
+    a.download = `DGA_${safeName}_${faultLabel}_${timestamp}.zip`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, [sessionData, sessionName, faultLabel]);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }, [sessionName, faultLabel]);
 
   // --- Format elapsed time ---
   const formatElapsed = (secs) => {
@@ -584,74 +836,82 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         const base = baselines[`mos${i}`] || 1;
         normPoint[`mos${i}`] = val / base;
       });
-      normPoint.ndir_abs = point.ndir_abs;
-      normPoint.ndir_resp = point.ndir_resp;
-      normPoint.ndir_ratio = point.ndir_ratio;
       return normPoint;
     });
   }, [sessionData, baselines]);
 
   const handleSaveGraph = useCallback(async () => {
-    if (normalizedSessionData.length === 0) {
-      setSaveGraphStatus('❌ Tidak ada data sesi. Jalankan sistem terlebih dahulu.');
+    const cycles = cycleDataRef.current
+      .map((rows, index) => ({ rows, cycleNumber: index + 1 }))
+      .filter(cycle => cycle.rows.length > 0);
+    if (cycles.length === 0 || Object.keys(baselines).length === 0) {
+      setSaveGraphStatus('❌ No cycle data or baselines are available to generate graphs.');
       return;
     }
     const ws = serialPortRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      setSaveGraphStatus('❌ Tidak terkoneksi ke backend. Hubungkan stream terlebih dahulu.');
+      setSaveGraphStatus('❌ Not connected to the backend. Connect the stream first.');
       return;
     }
 
-    setSaveGraphStatus('⏳ Generating graph...');
+    setSaveGraphStatus(`⏳ Generating ${cycles.length} cycle graph(s)...`);
     try {
-      const result = await new Promise((resolve, reject) => {
-        // Timeout 15 detik agar tidak stuck selamanya
-        const timeout = setTimeout(() => {
-          saveGraphPendingRef.current = null;
-          reject(new Error('Timeout: backend tidak merespon dalam 15 detik'));
-        }, 15000);
+      const graphFiles = [];
+      for (const [index, cycle] of cycles.entries()) {
+        setSaveGraphStatus(`⏳ Generating graph ${index + 1}/${cycles.length}...`);
+        const result = await new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            saveGraphPendingRef.current = null;
+            reject(new Error(`Timeout saat membuat graph cycle ${cycle.cycleNumber}`));
+          }, 30000);
 
-        saveGraphPendingRef.current = {
-          resolve: (val) => { clearTimeout(timeout); resolve(val); },
-          reject:  (err) => { clearTimeout(timeout); reject(err); },
-        };
-
-        const payload = JSON.stringify({
-          type: 'SAVE_GRAPH',
-          data: sessionData,
-          baselines: baselines,
-          sessionName: sessionName || 'session',
-          sensorNames: GAS_SENSORS.slice(0, 14),
+          saveGraphPendingRef.current = {
+            resolve: (value) => { clearTimeout(timeout); resolve(value); },
+          };
+          ws.send(JSON.stringify({
+            type: 'SAVE_GRAPH',
+            data: cycle.rows,
+            baselines,
+            sessionName: `${sessionName || 'session'}_cycle_${cycle.cycleNumber}`,
+            sensorNames: GAS_SENSORS.slice(0, 14),
+          }));
         });
-        ws.send(payload);
-      });
 
-      if (result.ok) {
-        // Handle client-side download using base64 from backend
-        const a = document.createElement('a');
-        a.href = `data:image/png;base64,${result.b64_image}`;
-        a.download = result.filename || 'DGA_Graph.png';
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        setSaveGraphStatus(`✅ Graph didownload!`);
-      } else {
-        setSaveGraphStatus(`❌ Error: ${result.error}`);
+        if (!result.ok || !result.b64_image) {
+          throw new Error(result.error || `Failed to generate graph for cycle ${cycle.cycleNumber}`);
+        }
+        const binary = atob(result.b64_image);
+        const imageBytes = Uint8Array.from(binary, char => char.charCodeAt(0));
+        graphFiles.push({ name: result.filename || `cycle_${cycle.cycleNumber}.png`, content: imageBytes });
       }
+
+      const blob = makeZipBlob(graphFiles);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const safeName = sessionName.trim().replace(/[^a-zA-Z0-9_-]/g, '_') || 'session';
+      a.href = url;
+      a.download = `DGA_${safeName}_cycle_graphs_${timestamp}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSaveGraphStatus(`✅ Downloaded ${graphFiles.length} cycle graph(s) as a ZIP file.`);
     } catch (e) {
       saveGraphPendingRef.current = null;
       setSaveGraphStatus(`❌ ${e.message}`);
     }
-  }, [normalizedSessionData, sessionData, baselines, sessionName]);
+  }, [baselines, sessionName]);
 
   const handleResetData = () => {
     setDataHistory([]);
+    latestDataRef.current = null;
+    sessionDataRef.current = [];
+    cycleDataRef.current = [];
+    setCompletedCycleCount(0);
     setSessionData([]);
     setBaselines({});
-    dataSnapshotIndexRef.current = 0;
   };
-
-  const [safetyWarning, setSafetyWarning] = useState(null);
 
   // Safety check effect
   useEffect(() => {
@@ -662,7 +922,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
          else if (latest.peltier_mode === 'SAFETY_HEAT') setSafetyWarning("FREEZING DETECTED (≤ 5°C)! Peltier forced to HEAT mode to protect sensors.");
          else if (latest.peltier_mode === 'SAFETY_OFF') setSafetyWarning("HIGH HUMIDITY (≥ 85%)! System forced OFF to protect sensors.");
       } else {
-         setSafetyWarning(null);
+         setSafetyWarning(prev => prev && /^(OVERHEAT|FREEZING|HIGH HUMIDITY)/.test(prev) ? null : prev);
       }
     }
   }, [dataHistory]);
@@ -677,12 +937,12 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               Start Stream
             </button>
           ) : (
-            <button className="btn btn-danger" onClick={disconnectSerial}>
+            <button className="btn btn-danger" onClick={disconnectSerial} disabled={systemRunning}>
               Stop Stream
             </button>
           )}
 
-          <button className="btn btn-secondary" onClick={handleResetData}>
+          <button className="btn btn-secondary" onClick={handleResetData} disabled={isRecording || systemRunning}>
             Reset Data
           </button>
 
@@ -732,7 +992,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               color: '#fff',
               animation: 'pulse 2s infinite',
             }}>
-              {currentPhase} — {formatPhaseTime(phaseTimeLeft)}
+              Cycle {currentCycleIndexRef.current + 1}/{cycleCount} · {currentPhase} — {formatPhaseTime(phaseTimeLeft)}
             </span>
           )}
 
@@ -933,45 +1193,91 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '20px' }}>
           {/* Large Combined Chart */}
           <div className="mini-chart-card" style={{ flex: 1, minHeight: '450px', display: 'flex', flexDirection: 'column' }}>
-            <div className="chart-header" style={{ marginBottom: '10px' }}>
-              <span className="chart-title" style={{ fontSize: '18px', textTransform: 'none' }}>Combined Gas Sensors Trend (mV)</span>
+            <div className="chart-header" style={{ marginBottom: '10px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '12px' }}>
+              <span className="chart-title" style={{ fontSize: '18px', textTransform: 'none' }}>
+                {combinedChartMode === 'gas' ? 'Gas Sensors Trend (mV)' : 'NDIR Trend'}
+              </span>
+              <select
+                className="select-input"
+                aria-label="Select a Combined Trend chart"
+                style={{ width: '150px', minWidth: '150px' }}
+                value={combinedChartMode}
+                onChange={(e) => setCombinedChartMode(e.target.value)}
+              >
+                <option value="gas">Gas Sensors (mV)</option>
+                <option value="ndir">NDIR Sensor</option>
+              </select>
             </div>
-            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: '300px' }}>
+            <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: '300px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
               {latestData ? (
-                <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={300}>
-                  <LineChart data={dataHistory} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
-                    <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
-                    <XAxis dataKey="time" stroke="#75BDE0" />
-                    <YAxis yAxisId="left" domain={[0, 5000]} stroke="#75BDE0" />
-                    <YAxis yAxisId="right" orientation="right" domain={['auto', 'auto']} stroke="#FF5733" />
-                    <Tooltip 
-                      contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
-                      itemStyle={{ color: '#ffffff' }}
-                    />
-                    <Legend wrapperStyle={{ paddingTop: '20px' }} />
-                    {GAS_SENSORS.slice(0, 14).map((name, i) => (
-                      <Line
+                combinedChartMode === 'gas' ? (
+                  <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={300}>
+                    <LineChart data={dataHistory} margin={{ top: 10, right: 30, left: 0, bottom: 0 }}>
+                      <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
+                      <XAxis dataKey="time" stroke="#75BDE0" />
+                      <YAxis
                         yAxisId="left"
-                        key={name}
-                        type="monotone"
-                        dataKey={`mos${i}`}
-                        name={name}
-                        stroke={GAS_COLORS[i % GAS_COLORS.length]}
-                        strokeWidth={2}
-                        dot={false}
-                        isAnimationActive={false}
-                        connectNulls={true}
+                        domain={[0, 5000]}
+                        ticks={[0, 1000, 2000, 3000, 4000, 5000]}
+                        allowDataOverflow={true}
+                        stroke="#75BDE0"
                       />
+                      <Tooltip
+                        contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
+                        itemStyle={{ color: '#ffffff' }}
+                      />
+                      <Legend wrapperStyle={{ paddingTop: '20px' }} />
+                      {GAS_SENSORS.slice(0, 14).map((name, i) => (
+                        <Line
+                          yAxisId="left"
+                          key={name}
+                          type="monotone"
+                          dataKey={`mos${i}`}
+                          name={name}
+                          stroke={GAS_COLORS[i % GAS_COLORS.length]}
+                          strokeWidth={2}
+                          dot={false}
+                          isAnimationActive={false}
+                          connectNulls={true}
+                        />
+                      ))}
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <div style={{ flex: 1, minHeight: '360px', display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))', gap: '14px' }}>
+                    {[
+                      { key: 'ndir_ratio', title: 'NDIR Ratio', color: '#3357FF', unit: 'x' },
+                      { key: 'ndir_resp', title: 'NDIR Response', color: '#33A852', unit: '%' },
+                      { key: 'ndir_abs', title: 'NDIR Absorbance', color: '#FF5733', unit: 'AU' },
+                    ].map(({ key, title, color, unit }) => (
+                      <div key={key} className="mini-chart-card" style={{ minWidth: 0, minHeight: '320px', display: 'flex', flexDirection: 'column' }}>
+                        <div className="chart-header"><span className="chart-title">{title} ({unit})</span></div>
+                        <div className="chart-area" style={{ flex: 1, minWidth: 0, minHeight: '260px' }}>
+                          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={260}>
+                            <LineChart data={dataHistory} margin={{ top: 10, right: 12, left: 0, bottom: 0 }}>
+                              <CartesianGrid strokeDasharray="2 2" vertical={false} stroke="#e2e8f0" />
+                              <XAxis dataKey="time" hide />
+                              <YAxis domain={['auto', 'auto']} width={48} tick={{ fontSize: 10 }} />
+                              <Tooltip
+                                contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
+                                itemStyle={{ color: '#ffffff' }}
+                                formatter={(value) => [`${Number(value).toFixed(4)} ${unit}`, title]}
+                              />
+                              <Line type="monotone" dataKey={key} name={title} stroke={color} strokeWidth={2} dot={false} isAnimationActive={false} connectNulls />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </div>
+                      </div>
                     ))}
-                    {/* IR12EM Sensors */}
-                    <Line yAxisId="right" type="monotone" dataKey="ndir_abs" name="IR12EM Absorbance (AU)" stroke="#FF5733" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
-                    <Line yAxisId="right" type="monotone" dataKey="ndir_resp" name="IR12EM Response (%)" stroke="#33FF57" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
-                    <Line yAxisId="right" type="monotone" dataKey="ndir_ratio" name="IR12EM Ratio (x)" stroke="#3357FF" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
-                  </LineChart>
-                </ResponsiveContainer>
+                  </div>
+                )
               ) : (
                 <div className="chart-empty" style={{ height: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                  No Data Connected
+                  {!isConnected
+                    ? 'Stream is not connected. Click Start Stream.'
+                    : dataHistory.length > 0
+                      ? 'Sensor stream is active. Click Start System to record data and generate the Normalized Trend.'
+                      : 'Backend is connected but has not received sensor data from the Teensy.'}
                 </div>
               )}
             </div>
@@ -1079,7 +1385,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                     <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(35, 63, 124, 0.3)" />
                     <XAxis dataKey="time" stroke="#75BDE0" />
                     <YAxis yAxisId="left" domain={['auto', 'auto']} stroke="#75BDE0" />
-                    <YAxis yAxisId="right" orientation="right" domain={['auto', 'auto']} stroke="#FF5733" />
                     <Tooltip 
                       contentStyle={{ backgroundColor: '#243F81', border: 'none', borderRadius: '8px', color: '#ffffff' }}
                       itemStyle={{ color: '#ffffff' }}
@@ -1099,10 +1404,6 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                         connectNulls={true}
                       />
                     ))}
-                    {/* IR12EM Sensors */}
-                    <Line yAxisId="right" type="monotone" dataKey="ndir_abs" name="IR12EM Absorbance (AU)" stroke="#FF5733" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
-                    <Line yAxisId="right" type="monotone" dataKey="ndir_resp" name="IR12EM Response (%)" stroke="#33FF57" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
-                    <Line yAxisId="right" type="monotone" dataKey="ndir_ratio" name="IR12EM Ratio (x)" stroke="#3357FF" strokeWidth={2} dot={false} isAnimationActive={false} connectNulls={true} />
                   </LineChart>
                 </ResponsiveContainer>
               ) : (
@@ -1118,7 +1419,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
       {/* ===== SYSTEM SETTINGS POPUP ===== */}
       {showSystemPopup && (
         <div className="modal-overlay" style={{ position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, backgroundColor: 'rgba(0,0,0,0.7)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000 }}>
-          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '560px', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)' }}>
+          <div className="modal-content" style={{ backgroundColor: '#ffffff', color: '#1e293b', padding: '28px', borderRadius: '12px', width: '560px', maxHeight: '90vh', overflowY: 'auto', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.25)' }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '24px' }}>
               <h3 style={{ margin: 0, color: '#0f172a', fontSize: '20px' }}>⚙️ System Phase Settings</h3>
               <button onClick={() => setShowSystemPopup(false)} style={{ background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: '20px' }}>✕</button>
@@ -1187,6 +1488,26 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                 </div>
               </div>
 
+              {/* Number of complete phase cycles */}
+              <div style={{ backgroundColor: '#ffffff', padding: '16px', borderRadius: '8px', border: '1px solid #BFDBFE' }}>
+                <label htmlFor="acquisition-cycle-count" style={{ display: 'block', fontWeight: '700', color: '#1E40AF', fontSize: '15px', marginBottom: '8px' }}>
+                  Number of Cycles
+                </label>
+                <input
+                  id="acquisition-cycle-count"
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value={cycleCount}
+                  onChange={(e) => setCycleCount(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
+                  style={{ width: '100%', padding: '9px 10px', borderRadius: '6px', border: '1px solid #CBD5E1', color: '#1e293b' }}
+                />
+                <div style={{ fontSize: '12px', color: '#6B7280', marginTop: '6px' }}>
+                  Each cycle runs IDLE → INJECT → PURGE and is saved as its own CSV.
+                </div>
+              </div>
+
               {/* PUMP1 PWM Slider */}
               <div style={{ backgroundColor: '#ffffff', padding: '16px', borderRadius: '8px', border: '1px solid #BFDBFE' }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
@@ -1212,8 +1533,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             {/* Summary + Buttons */}
             <div style={{ marginTop: '20px', padding: '12px 16px', backgroundColor: '#EFF6FF', borderRadius: '8px', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
               <div style={{ fontSize: '13px', color: '#475569' }}>
-                Total Duration: <strong>{(idleDuration + injectDuration + purgeDuration).toFixed(1)} min</strong>
-                {' '}({formatElapsed(Math.round((idleDuration + injectDuration + purgeDuration) * 60))})
+                Total Duration: <strong>{((idleDuration + injectDuration + purgeDuration) * cycleCount).toFixed(1)} min</strong>
+                {' '}({formatElapsed(Math.round((idleDuration + injectDuration + purgeDuration) * cycleCount * 60))})
+                <div style={{ marginTop: '3px' }}>{cycleCount} cycle(s) · {((idleDuration + injectDuration + purgeDuration)).toFixed(1)} min each</div>
               </div>
               <div style={{ display: 'flex', gap: '10px' }}>
                 <button 
@@ -1288,11 +1610,16 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
           <div style={{ fontSize: '48px', marginBottom: '12px' }}>✅</div>
           <h3 style={{ margin: '0 0 8px 0', color: '#0f172a', fontSize: '20px' }}>System Phases Completed!</h3>
           <p style={{ color: '#475569', marginBottom: '6px' }}>
-            All phases (Idle &rarr; Injecting &rarr; Purging) have finished.
+            {completedCycleCount} cycle(s) recorded. Each cycle contains the selected IDLE, INJECT, and PURGE phases.
           </p>
           <p style={{ color: '#64748b', fontSize: '14px', marginBottom: '20px' }}>
-            <strong>{sessionData.length}</strong> data points recorded during session &quot;<strong>{sessionName}</strong>&quot;.
+            <strong>{sessionDataRef.current.length}</strong> data points recorded for session &quot;<strong>{sessionName}</strong>&quot;.
           </p>
+          {(frameDiagnostics.missing || frameDiagnostics.malformed || frameDiagnostics.duplicates || frameDiagnostics.resets) > 0 && (
+            <p style={{ color: '#b45309', fontSize: '13px', marginBottom: '16px' }}>
+              Stream quality: {frameDiagnostics.missing} samples missing, {frameDiagnostics.malformed} malformed frames ({frameDiagnostics.nonNumeric} non-numeric values; frame lengths: {Object.entries(frameDiagnostics.malformedLengths).map(([length, count]) => `${length} fields × ${count}`).join(', ') || '-'}), {frameDiagnostics.duplicates} duplicates, {frameDiagnostics.resets} sequence resets.
+            </p>
+          )}
 
             {saveGraphStatus && (
               <p style={{
@@ -1320,7 +1647,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                 }}
                 style={{ display: 'flex', alignItems: 'center', gap: '6px' }}
               >
-                <Save size={16} /> Save as CSV
+                <Save size={16} /> Download cycle CSVs (.zip)
               </button>
               <button
                 className="btn btn-primary"
@@ -1328,7 +1655,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
                 onClick={handleSaveGraph}
                 style={{ display: 'flex', alignItems: 'center', gap: '6px', backgroundColor: '#7c3aed', borderColor: '#7c3aed' }}
               >
-                📊 Save Graph (PNG)
+                📊 Download cycle graphs (.zip)
               </button>
             </div>
           </div>
@@ -1346,6 +1673,9 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             <p style={{ fontSize: '16px', lineHeight: '1.5', margin: 0, fontWeight: '500' }}>
               {safetyWarning}
             </p>
+            <button className="btn btn-danger" onClick={() => setSafetyWarning(null)} style={{ marginTop: '18px' }}>
+              Tutup peringatan
+            </button>
           </div>
         </div>
       )}
