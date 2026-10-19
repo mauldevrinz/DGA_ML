@@ -37,6 +37,7 @@ const X_PHYS:    u64 = 0x7000_0000;  // 148 byte input
 const LOGIT_PHYS: u64 = 0x7000_1000; // 20  byte output
 
 /// Muat bitstream ke FPGA via fpgautil.
+#[allow(dead_code)]
 pub fn load_bitstream(bit: &Path, hwh: &Path) -> io::Result<()> {
     let status = std::process::Command::new("fpgautil")
         .args([

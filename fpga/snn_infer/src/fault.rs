@@ -5,6 +5,7 @@
 use serde::Deserialize;
 use std::path::Path;
 
+#[allow(dead_code)]
 const LEAF: i64 = -1;
 
 #[derive(Deserialize)]
@@ -21,7 +22,9 @@ pub struct RfTree {
 pub struct RfModel {
     pub trees:      Vec<RfTree>,
     pub classes:    Vec<String>,
+    #[allow(dead_code)]
     pub n_features: usize,
+    #[allow(dead_code)]
     pub gas_classes: Vec<String>,
 }
 

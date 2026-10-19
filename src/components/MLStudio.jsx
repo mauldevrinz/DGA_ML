@@ -90,26 +90,27 @@ const MLStudio = () => {
   };
 
   return (
-    <div className="page-container" style={{ paddingBottom: '40px', position: 'relative' }}>
-      {/* UNDER DEVELOPMENT POPUP CONTAINER */}
+    <div className="page-container" style={{ paddingBottom: '40px', position: 'relative', minHeight: 'calc(100vh - 160px)' }}>
+      {/* UNDER DEVELOPMENT OVERLAY (Scoped to page content, sidebar remains fully accessible) */}
       <div style={{
-        position: 'fixed',
+        position: 'absolute',
         inset: 0,
-        backgroundColor: 'rgba(15, 23, 42, 0.65)',
-        backdropFilter: 'blur(4px)',
-        zIndex: 999,
+        backgroundColor: 'rgba(15, 23, 42, 0.45)',
+        backdropFilter: 'blur(3px)',
+        zIndex: 20,
         display: 'flex',
         alignItems: 'center',
         justifyContent: 'center',
-        padding: '20px'
+        padding: '24px',
+        borderRadius: '16px'
       }}>
         <div style={{
           backgroundColor: '#ffffff',
           color: '#0f172a',
-          padding: '40px 36px',
+          padding: '44px 36px',
           borderRadius: '16px',
           boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.35)',
-          maxWidth: '440px',
+          maxWidth: '460px',
           width: '100%',
           textAlign: 'center',
           border: '1px solid #e2e8f0'
@@ -118,13 +119,13 @@ const MLStudio = () => {
             display: 'inline-flex',
             alignItems: 'center',
             justifyContent: 'center',
-            width: '64px',
-            height: '64px',
+            width: '68px',
+            height: '68px',
             borderRadius: '50%',
             backgroundColor: '#fef3c7',
             color: '#d97706',
-            fontSize: '32px',
-            marginBottom: '16px'
+            fontSize: '34px',
+            marginBottom: '18px'
           }}>
             🚧
           </div>
@@ -141,10 +142,10 @@ const MLStudio = () => {
           <p style={{
             fontSize: '14px',
             color: '#64748b',
-            lineHeight: 1.5,
+            lineHeight: 1.6,
             margin: 0
           }}>
-            This feature is currently under active development and will be available in an upcoming update.
+            This feature is currently under active development. You can navigate to other menus via the sidebar.
           </p>
         </div>
       </div>

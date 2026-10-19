@@ -57,11 +57,11 @@ for est in rf.estimators_:
 
 fault_json = {
     "trees":       trees,
-    "classes":     fault_classes,   # ["T1","D1","N"]
+    "classes":     rf.classes_.tolist(),   # ["D1", "N", "T1"] dari estimator asli
     "n_features":  rf.n_features_in_,
     "gas_classes": gas_classes,
 }
 (OUT / "fault_trees.json").write_text(json.dumps(fault_json))
-print(f"  → {OUT / 'fault_trees.json'}  ({len(trees)} pohon, {len(fault_classes)} kelas)")
+print(f"  → {OUT / 'fault_trees.json'}  ({len(trees)} pohon, classes: {rf.classes_.tolist()})")
 
 print("\nEkspor selesai. Salin folder models/ sejajar dengan binary snn_infer.")

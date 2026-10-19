@@ -27,7 +27,7 @@ mod fault;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::io::{self, Read};
+use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 

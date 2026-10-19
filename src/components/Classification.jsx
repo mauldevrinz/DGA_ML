@@ -24,6 +24,7 @@ const Classification = () => {
   const wsRef = useRef(null);
   const csvModeRef = useRef(false);
   const intervalRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   // Latest sensor data received from Acquisition stream
   const [sensorData, setSensorData] = useState(null);
@@ -460,12 +461,38 @@ ${json.error || 'Unknown FPGA error'}`);
 
             {/* CSV Upload */}
             <div style={{ position: 'relative', marginTop: '12px' }}>
-              <input type="file" accept=".csv" style={{ display: 'none' }} id="csv-upload" onChange={handleCsvUpload} />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv"
+                style={{ display: 'none' }}
+                id="csv-upload"
+                onChange={handleCsvUpload}
+              />
               <button
+                type="button"
                 className="btn btn-outline"
-                style={{ width: '100%', height: '42px', fontSize: '14px', display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '8px' }}
-                onClick={() => document.getElementById('csv-upload').click()}
-                disabled={!wsConnected}
+                style={{
+                  width: '100%',
+                  height: '42px',
+                  fontSize: '14px',
+                  display: 'flex',
+                  justifyContent: 'center',
+                  alignItems: 'center',
+                  gap: '8px',
+                  cursor: 'pointer'
+                }}
+                onClick={() => {
+                  if (!wsConnected) {
+                    connectWs();
+                  }
+                  if (fileInputRef.current) {
+                    fileInputRef.current.value = '';
+                    fileInputRef.current.click();
+                  } else {
+                    document.getElementById('csv-upload')?.click();
+                  }
+                }}
               >
                 <Upload size={16} /> Predict from CSV File
               </button>

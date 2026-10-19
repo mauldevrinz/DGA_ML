@@ -44,8 +44,8 @@ def _diagnose_iec60599(gas_confidences, predicted_fault=None):
     ch4  = gas_confidences.get('CH4', 0)
     other = gas_confidences.get('OTHER', 0)
 
-    # Map ML predicted_fault if present
-    if predicted_fault == "N":
+    # Prioritaskan prediksi Random Forest ML model jika valid
+    if predicted_fault in ("N", "Normal"):
         return {"fault_code": "Normal", "fault_type": "No Fault (Normal Oil)",
                 "description": "Transformer oil condition is normal", "severity": "normal"}
     elif predicted_fault == "D1":
@@ -55,22 +55,22 @@ def _diagnose_iec60599(gas_confidences, predicted_fault=None):
         return {"fault_code": "T1", "fault_type": "Thermal Fault (<300°C)",
                 "description": "Low-temperature thermal fault (<300°C)", "severity": "caution"}
 
-    # Rule-based fallback
-    fault_total = c2h2 + c2h4 + h2
-    if fault_total < 10 or other > 70:
+    # Rule-based fallback hanya jika ML tidak menghasilkan prediksi
+    fault_total = c2h2 + c2h4 + h2 + ch4
+    if fault_total < 15:
         return {"fault_code": "Normal", "fault_type": "No Fault",
                 "description": "No fault detected / low dissolved gas concentration", "severity": "normal"}
 
-    r1 = c2h2 / max(c2h4, 1)
+    r1 = c2h2 / max(c2h4, 1.0)
     if c2h2 > 30 and h2 > 30:
-        return {"fault_code": "D2", "fault_type": "Electrical Fault",
-                "description": f"High Energy Discharge — Arcing (C2H2/C2H4={r1:.2f})", "severity": "critical"}
+        return {"fault_code": "D1", "fault_type": "Electrical Fault",
+                "description": f"High Energy Discharge — Sparking/Arcing (C2H2/C2H4={r1:.2f})", "severity": "critical"}
     if c2h4 > 40:
-        return {"fault_code": "T2", "fault_type": "Thermal Fault",
-                "description": "Thermal Fault detected (>300°C)", "severity": "warning"}
+        return {"fault_code": "T1", "fault_type": "Thermal Fault",
+                "description": "Thermal Fault detected (<300°C)", "severity": "warning"}
 
-    return {"fault_code": "T1", "fault_type": "Thermal Fault",
-            "description": "Low-temperature thermal fault (<300°C)", "severity": "caution"}
+    return {"fault_code": "Normal", "fault_type": "No Fault",
+            "description": "Dissolved gas levels within acceptable limits", "severity": "normal"}
 
 
 _snn_proc = None
