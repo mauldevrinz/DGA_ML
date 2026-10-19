@@ -35,11 +35,11 @@ echo ""
 
 echo "⚙️  Membangun Rust Backend (cargo build)..."
 echo "====================================="
-# Asumsi Cargo.toml ada di folder persistence_rs atau root
-if [ -f "Cargo.toml" ] || [ -f "persistence_rs/Cargo.toml" ]; then
-    (cd persistence_rs 2>/dev/null || true; cargo build)
-else
-    echo "⚠️  Cargo.toml tidak ditemukan, skip build Rust."
+if [ -f "persistence_rs/Cargo.toml" ]; then
+    (cd persistence_rs && cargo build --release)
+fi
+if [ -f "fpga/snn_infer/Cargo.toml" ]; then
+    (cd fpga/snn_infer && cargo build --release)
 fi
 
 echo ""

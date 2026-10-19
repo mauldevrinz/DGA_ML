@@ -4,7 +4,65 @@ import { User, GraduationCap, Award } from 'lucide-react';
 
 const About = () => {
   return (
-    <div className="page-container">
+    <div className="page-container" style={{ position: 'relative' }}>
+      {/* UNDER DEVELOPMENT POPUP CONTAINER */}
+      <div style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: 'rgba(15, 23, 42, 0.65)',
+        backdropFilter: 'blur(4px)',
+        zIndex: 999,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '20px'
+      }}>
+        <div style={{
+          backgroundColor: '#ffffff',
+          color: '#0f172a',
+          padding: '40px 36px',
+          borderRadius: '16px',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.35)',
+          maxWidth: '440px',
+          width: '100%',
+          textAlign: 'center',
+          border: '1px solid #e2e8f0'
+        }}>
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '64px',
+            height: '64px',
+            borderRadius: '50%',
+            backgroundColor: '#fef3c7',
+            color: '#d97706',
+            fontSize: '32px',
+            marginBottom: '16px'
+          }}>
+            🚧
+          </div>
+          <h2 style={{
+            fontSize: '22px',
+            fontWeight: 800,
+            letterSpacing: '1px',
+            color: '#0f172a',
+            margin: '0 0 10px 0',
+            textTransform: 'uppercase'
+          }}>
+            UNDER DEVELOPMENT
+          </h2>
+          <p style={{
+            fontSize: '14px',
+            color: '#64748b',
+            lineHeight: 1.5,
+            margin: 0
+          }}>
+            This page is currently under active development and will be available in an upcoming update.
+          </p>
+        </div>
+      </div>
+
       <div className="page-header">
         <h2 className="page-title">About Project</h2>
       </div>
@@ -16,7 +74,7 @@ const About = () => {
             <img src="/ELKA LOGO.jpg" alt="ELKA" className="inst-logo" onError={(e) => e.target.style.display='none'} />
           </div>
           <div className="title-container">
-            <span className="title-badge">PROPOSAL TUGAS AKHIR</span>
+            <span className="title-badge">FINAL PROJECT THESIS</span>
             <h1 className="project-title">DGA Electronic Nose</h1>
             <p className="project-subtitle">Transformer Oil Fault Diagnosis System</p>
           </div>
@@ -40,10 +98,10 @@ const About = () => {
             <div className="detail-section">
               <span className="section-label"><GraduationCap size={14} /> DEPARTMENT</span>
               <p className="dept-text">
-                <strong style={{ color: 'var(--text-primary)' }}>D-4 Teknologi Rekayasa Instrumentasi</strong><br/>
-                Departemen Teknik Instrumentasi<br/>
-                Fakultas Vokasi<br/>
-                Institut Teknologi Sepuluh Nopember
+                <strong style={{ color: 'var(--text-primary)' }}>D-4 Instrumentation Engineering Technology</strong><br/>
+                Department of Instrumentation Engineering<br/>
+                Faculty of Vocational Studies<br/>
+                Institut Teknologi Sepuluh Nopember (ITS)
               </p>
             </div>
 

@@ -8,8 +8,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-BIT_FILE="$SCRIPT_DIR/bitstream/snn_top.bit"
-BIN_FILE="$SCRIPT_DIR/bitstream/snn_top.bin"
+BIT_FILE="$SCRIPT_DIR/snn_new/snn.bit"
+BIN_FILE="$SCRIPT_DIR/snn_new/snn.bin"
 
 FIRMWARE_DIR="/lib/firmware/xilinx/snn_accel"
 FIRMWARE_NAME="snn_accel"
@@ -89,6 +89,5 @@ else
     echo "      Make sure to run the inference script with sudo."
 fi
 
-echo ""
-echo "Next: Run inference with:"
-echo "  sudo python3 fpga/snn_driver.py"
+echo "Next: Run inference with Rust binary:"
+echo "  /home/petalinux/maulvin/DGA_ML/fpga/snn_infer/target/release/snn_infer"

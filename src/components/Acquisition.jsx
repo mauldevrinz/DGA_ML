@@ -136,8 +136,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
   const [serialPort, setSerialPort] = useState(null);
   const serialPortRef = useRef(null);
 
-  // Pending SAVE_GRAPH response callback (resolve/reject dari koneksi WS yang ada)
-  // Menghindari buka WS baru yang langsung menerima broadcast Teensy sebelum response SAVE_GRAPH
+  // Pending SAVE_GRAPH response callback (resolve/reject from existing WS connection)
+  // Avoids opening a new WS that would immediately receive Teensy broadcast before SAVE_GRAPH response
   const saveGraphPendingRef = useRef(null);
 
   // Peltier setpoint control
@@ -862,7 +862,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
         const result = await new Promise((resolve, reject) => {
           const timeout = setTimeout(() => {
             saveGraphPendingRef.current = null;
-            reject(new Error(`Timeout saat membuat graph cycle ${cycle.cycleNumber}`));
+            reject(new Error(`Timeout generating graph for cycle ${cycle.cycleNumber}`));
           }, 30000);
 
           saveGraphPendingRef.current = {
@@ -1094,8 +1094,8 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
             latestData={latestData}
           />
 
-          {/* INA226 Current Sensors: #1 mengukur arus & tegangan aktuator,
-              #2 mengukur arus & tegangan suplai sensor + mikrokontroller */}
+          {/* INA226 Current Sensors: #1 measures actuator current & voltage,
+              #2 measures sensor + microcontroller supply current & voltage */}
           <MiniChart
             title="ACTUATOR CURRENT"
             dataKey="ina1_i"
@@ -1674,7 +1674,7 @@ const Acquisition = ({ isConnected, setIsConnected }) => {
               {safetyWarning}
             </p>
             <button className="btn btn-danger" onClick={() => setSafetyWarning(null)} style={{ marginTop: '18px' }}>
-              Tutup peringatan
+              Dismiss Warning
             </button>
           </div>
         </div>

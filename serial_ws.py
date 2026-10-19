@@ -22,154 +22,153 @@ from tsfresh.utilities.dataframe_functions import impute
 
 from fuzzy_pid import FuzzyPIDController
 
-# --- SNN FPGA inference setup ---
+# --- SNN FPGA inference setup via Rust Binary ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PARAMS_FILE = os.path.join(SCRIPT_DIR, "fpga", "bitstream", "params.bin")
-_snn_params_data = None
-_snn_lock = threading.Lock()
+RUST_SNN_BIN = os.path.join(SCRIPT_DIR, "fpga", "snn_infer", "target", "release", "snn_infer")
+_sensor_history = deque(maxlen=288)
+_sensor_history_lock = threading.Lock()
 
-def _load_snn_params():
-    """Load SNN parameters from disk (once)."""
-    global _snn_params_data
-    if _snn_params_data is None:
-        if os.path.exists(PARAMS_FILE):
-            with open(PARAMS_FILE, "rb") as f:
-                _snn_params_data = f.read()
-            print(f"SNN params loaded: {len(_snn_params_data)} bytes")
-        else:
-            print(f"Warning: SNN params not found at {PARAMS_FILE}")
-    return _snn_params_data
+def update_sensor_history(sensor_row):
+    """Keep rolling buffer of 16 MOS sensor readings (mV)."""
+    with _sensor_history_lock:
+        _sensor_history.append(list(sensor_row[:16]))
 
-def _diagnose_iec60599(gas_confidences):
+def _diagnose_iec60599(gas_confidences, predicted_fault=None):
     """
-    Rule-based IEC 60599 fault diagnosis from gas composition confidences.
-    Matches logic from colab/DGA_ML_GasComposition_Training.py
-    Input: dict with keys 'AIR','C2H2','C2H4','H2','CH4' (confidence 0-100)
-    Returns: dict with fault_code, fault_type, description, severity
+    Combines ML fault classification (T1, D1, N) with IEC 60599 diagnosis.
+    Gas keys: C2H2, C2H4, CH4, H2, OTHER (confidence 0-100).
     """
     c2h2 = gas_confidences.get('C2H2', 0)
     c2h4 = gas_confidences.get('C2H4', 0)
     h2   = gas_confidences.get('H2', 0)
     ch4  = gas_confidences.get('CH4', 0)
-    udara = gas_confidences.get('AIR', 0)
+    other = gas_confidences.get('OTHER', 0)
 
-    SIGNIFICANT = 30
+    # Map ML predicted_fault if present
+    if predicted_fault == "N":
+        return {"fault_code": "Normal", "fault_type": "No Fault (Normal Oil)",
+                "description": "Transformer oil condition is normal", "severity": "normal"}
+    elif predicted_fault == "D1":
+        return {"fault_code": "D1", "fault_type": "Electrical Fault (Low Energy)",
+                "description": "Low Energy Discharge — Sparking", "severity": "warning"}
+    elif predicted_fault == "T1":
+        return {"fault_code": "T1", "fault_type": "Thermal Fault (<300°C)",
+                "description": "Low-temperature thermal fault (<300°C)", "severity": "caution"}
 
-    # All gas low or clean air dominant
-    if udara > 70 and c2h2 < SIGNIFICANT and c2h4 < SIGNIFICANT and h2 < SIGNIFICANT:
-        return {"fault_code": "Normal", "fault_type": "No Fault",
-                "description": "Tidak ada fault terdeteksi", "severity": "normal"}
-
+    # Rule-based fallback
     fault_total = c2h2 + c2h4 + h2
-    if fault_total < 10:
+    if fault_total < 10 or other > 70:
         return {"fault_code": "Normal", "fault_type": "No Fault",
-                "description": "Konsentrasi fault gas terlalu rendah", "severity": "normal"}
+                "description": "No fault detected / low dissolved gas concentration", "severity": "normal"}
 
-    p_c2h2 = c2h2 / fault_total
-    p_c2h4 = c2h4 / fault_total
-    p_h2   = h2 / fault_total
     r1 = c2h2 / max(c2h4, 1)
-
-    # D2: High Energy Discharge (Arcing)
-    if p_c2h2 > 0.40 and h2 > SIGNIFICANT:
+    if c2h2 > 30 and h2 > 30:
         return {"fault_code": "D2", "fault_type": "Electrical Fault",
-                "description": f"High Energy Discharge — Arcing (C2H2/C2H4={r1:.2f})",
-                "severity": "critical"}
-
-    # D1: Low Energy Discharge (Sparking)
-    if p_c2h2 > 0.25 and c2h2 > SIGNIFICANT:
-        return {"fault_code": "D1", "fault_type": "Electrical Fault",
-                "description": f"Low Energy Discharge — Sparking (C2H2/C2H4={r1:.2f})",
-                "severity": "warning"}
-
-    # PD: Partial Discharge
-    if p_h2 > 0.50 and c2h2 < SIGNIFICANT:
-        return {"fault_code": "PD", "fault_type": "Electrical Fault",
-                "description": f"Partial Discharge (H2={p_h2:.0%})", "severity": "caution"}
-
-    # T3: Thermal Fault > 700°C
-    if p_c2h4 > 0.60 and c2h4 > 60:
-        return {"fault_code": "T3", "fault_type": "Thermal Fault",
-                "description": f"Thermal Fault > 700°C (C2H4={c2h4:.0f}%)", "severity": "critical"}
-
-    # T2: Thermal Fault 300-700°C
-    if p_c2h4 > 0.40 and c2h4 > SIGNIFICANT:
+                "description": f"High Energy Discharge — Arcing (C2H2/C2H4={r1:.2f})", "severity": "critical"}
+    if c2h4 > 40:
         return {"fault_code": "T2", "fault_type": "Thermal Fault",
-                "description": f"Thermal Fault 300–700°C (C2H4={p_c2h4:.0%})", "severity": "warning"}
-
-    # T1: Thermal Fault < 300°C
-    if p_c2h4 > 0.20 or c2h4 > SIGNIFICANT:
-        return {"fault_code": "T1", "fault_type": "Thermal Fault",
-                "description": "Thermal Fault < 300°C", "severity": "caution"}
-
-    # DT: Mixed Thermal & Electrical
-    if c2h2 > SIGNIFICANT and c2h4 > SIGNIFICANT:
-        return {"fault_code": "DT", "fault_type": "Mixed Fault",
-                "description": f"Mixed Thermal & Electrical (C2H2={c2h2:.0f}%, C2H4={c2h4:.0f}%)",
-                "severity": "critical"}
+                "description": "Thermal Fault detected (>300°C)", "severity": "warning"}
 
     return {"fault_code": "T1", "fault_type": "Thermal Fault",
-            "description": "Thermal Fault < 300°C", "severity": "caution"}
+            "description": "Low-temperature thermal fault (<300°C)", "severity": "caution"}
 
 
-def snn_fpga_inference(sensor_values):
+_snn_proc = None
+_snn_proc_lock = threading.Lock()
+
+def _get_snn_proc():
+    global _snn_proc
+    if _snn_proc is None or _snn_proc.poll() is not None:
+        if not os.path.exists(RUST_SNN_BIN):
+            return None
+        _snn_proc = subprocess.Popen(
+            [RUST_SNN_BIN],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+    return _snn_proc
+
+def snn_rust_inference(recording, use_hw=False):
     """
-    Run SNN inference on the FPGA with given sensor values.
-    sensor_values: list of 16 float values (MOS sensor readings in mV)
-    Returns: dict with classification results
+    Run SNN & Fault inference using persistent daemon Rust binary snn_infer.
+    recording: list of lists [N, 16] (float values in mV).
     """
+    global _snn_proc
     try:
-        # Add the fpga directory to path so we can import snn_driver
-        import sys
-        fpga_dir = os.path.join(SCRIPT_DIR, "fpga")
-        if fpga_dir not in sys.path:
-            sys.path.insert(0, fpga_dir)
-        from snn_driver import run_inference
+        # Jika cuma 1 snapshot / kurang dari 3 sampel, duplikasi sedikit agar fitur time-series valid
+        if len(recording) < 5:
+            base = list(recording[-1]) if recording else [0.0]*16
+            recording = [base for _ in range(10)]
 
-        params = _load_snn_params()
-        if params is None:
-            return {"ok": False, "error": "SNN params.bin not found"}
-
-        # Pack sensor values as float32 input
-        input_data = struct.pack(f"<{len(sensor_values)}f", *sensor_values)
-
-        # Output: 5 float32 (5 DGA fault classes)
-        output_size = 20
-
+        payload = json.dumps({"recording": recording, "use_hw": use_hw})
         t0 = time.monotonic()
-        with _snn_lock:
-            result_bytes = run_inference(input_data, params, output_size, verbose=False)
-        elapsed_ms = (time.monotonic() - t0) * 1000
 
-        # Parse output — 5 neurons = confidence per gas (matches training)
-        outputs = list(struct.unpack("<5f", result_bytes))
+        with _snn_proc_lock:
+            proc = _get_snn_proc()
+            if proc is None:
+                return {"ok": False, "error": f"Rust SNN binary not found at {RUST_SNN_BIN}."}
 
-        GAS_NAMES = ["AIR", "C2H2", "C2H4", "H2", "CH4"]
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+            out = proc.stdout.readline()
 
-        # Build gas confidence dict (0-100 scale)
-        gas_confidences = {}
-        for i, name in enumerate(GAS_NAMES):
-            gas_confidences[name] = round(float(outputs[i]) * 100, 1)
+        total_time_ms = round((time.monotonic() - t0) * 1000, 2)
 
-        # IEC 60599 rule-based fault diagnosis from gas composition
-        iec_diagnosis = _diagnose_iec60599(gas_confidences)
+        if not out:
+            # Jika proses mati mendadak, restart
+            with _snn_proc_lock:
+                _snn_proc = None
+            return {"ok": False, "error": "Rust SNN daemon process closed unexpectedly."}
 
-        predicted_idx = max(range(5), key=lambda i: outputs[i])
+        res = json.loads(out)
+        if not res.get("ok"):
+            return res
+
+        gas_conf = res.get("gas_confidences", {})
+        pred_fault = res.get("predicted_fault", "Normal")
+        iec_diag = _diagnose_iec60599(gas_conf, pred_fault)
+
+        # Samakan urutan output array untuk kompatibilitas frontend
+        gas_names = res.get("gas_names", ["C2H2", "C2H4", "CH4", "H2", "OTHER"])
+        outputs = [gas_conf.get(g, 0.0) / 100.0 for g in gas_names]
 
         return {
             "ok": True,
             "outputs": outputs,
-            "gas_names": GAS_NAMES,
-            "gas_confidences": gas_confidences,
-            "predicted_gas": GAS_NAMES[predicted_idx],
-            "predicted_idx": predicted_idx,
-            "confidence": outputs[predicted_idx],
-            "iec_diagnosis": iec_diagnosis,
-            "latency_ms": round(elapsed_ms, 2),
+            "gas_names": gas_names,
+            "gas_confidences": gas_conf,
+            "predicted_gas": res.get("predicted_gas"),
+            "predicted_idx": res.get("predicted_idx"),
+            "confidence": res.get("confidence"),
+            "predicted_fault": pred_fault,
+            "iec_diagnosis": iec_diag,
+            "feature_latency_ms": res.get("feature_ms", 0.0),
+            "latency_ms": res.get("latency_ms", 0.0),
+            "total_latency_ms": total_time_ms,
+            "mode": res.get("mode", "sw")
         }
     except Exception as e:
         import traceback
+        with _snn_proc_lock:
+            _snn_proc = None
         return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+
+
+def snn_fpga_inference(sensor_values):
+    """Wrapper untuk panggilan single frame live dari GUI."""
+    if isinstance(sensor_values, list) and sensor_values and isinstance(sensor_values[0], list):
+        rec = sensor_values
+    else:
+        # Gunakan rolling history jika tersedia, tambahkan frame terbaru
+        update_sensor_history(sensor_values)
+        with _sensor_history_lock:
+            rec = list(_sensor_history)
+        if len(rec) < 10:
+            rec = [sensor_values for _ in range(10)]
+    return snn_rust_inference(rec, use_hw=False)
 
 setpoint = 0.0
 fuzzy_controller = FuzzyPIDController(kp=5.0, ki=0.5, kd=1.0)
@@ -503,35 +502,6 @@ def generate_gnuplot_graph(data, baselines, session_name, sensor_names):
     }
 
 
-def csv_to_model_features(rows):
-    feature_file = os.path.join(SCRIPT_DIR, "colab", "selected_feature_names.json")
-    model_file = os.path.join(SCRIPT_DIR, "colab", "snn_gas_composition.json")
-    with open(feature_file) as f: feature_names = json.load(f)["feature_names"]
-    with open(model_file) as f: model = json.load(f)
-    sensor_names = ["mos0_mV","mos1_mV","mos2_mV","mos3_mV","mos4_mV","mos5_mV","mos6_mV","mos7_mV","mos8_mV","mos9_mV","mos10_mV","mos11_mV","mos12_mV","mos13_mV","mos14_mV","mos15_mV","temp_chamber_C","temp_oil_C","humidity_chamber_pct","humidity_oil_pct","ina226_1_vbus_V","ina226_1_current_mA","ina226_1_power_W","ina226_2_vbus_V","ina226_2_current_mA","ina226_2_power_W","kria_vbus_V","kria_current_mA","kria_power_W","ndir_ratio","ndir_baseline","ndir_response_pct","ndir_absorbance_au","flow_inlet"]
-    df = pd.DataFrame(rows)
-    if df.empty or len(df) < 288:
-        raise ValueError(f'CSV membutuhkan minimal 288 baris; diterima {len(df)}')
-    missing = [name for name in sensor_names if name not in df.columns]
-    if missing:
-        raise ValueError('Kolom sensor CSV hilang: ' + ', '.join(missing))
-    df = df[sensor_names].apply(pd.to_numeric, errors='coerce')
-    invalid = [name for name in sensor_names if df[name].isna().any()]
-    if invalid:
-        raise ValueError('Nilai non-numerik/NaN pada kolom: ' + ', '.join(invalid))
-    missing=[c for c in sensor_names if c not in df.columns]
-    if missing: raise ValueError("CSV missing columns: " + ", ".join(missing))
-    df = df[sensor_names]
-    df["id"]=0; df["time"]=np.arange(len(df))
-    features=extract_features(df, column_id="id", column_sort="time", default_fc_parameters=EfficientFCParameters(), disable_progressbar=True)
-    impute(features)
-    for name in feature_names:
-        if name not in features: features[name]=0.0
-    x=features[feature_names].to_numpy(dtype=np.float32)[0]
-    mean=np.asarray(model["norm"]["mean"],dtype=np.float32); std=np.asarray(model["norm"]["std"],dtype=np.float32)
-    if len(x)!=7530 or len(mean)!=len(x): raise ValueError(f"feature dimension mismatch: {len(x)}")
-    return np.nan_to_num((x-mean)/np.where(std==0,1.0,std)).tolist()
-
 def _snn_worker(sensor_values, result_queue):
     try:
         result_queue.put(snn_fpga_inference(sensor_values))
@@ -620,16 +590,30 @@ async def handler(websocket):
                     if cmd.get('type') == 'SNN_CSV_INFER':
                         rows = cmd.get('rows', [])
                         await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'validating','progress':10,'message':'Validating CSV data'}))
-                        if len(rows) < 288: raise ValueError(f"CSV needs 288 rows, got {len(rows)}")
+                        if len(rows) < 10: raise ValueError(f"CSV membutuhkan minimal 10 baris sensor, diterima {len(rows)}")
                         request_t0 = time.monotonic()
-                        feature_t0 = time.monotonic()
-                        values = csv_to_model_features(rows[:288])
-                        feature_latency_ms = round((time.monotonic() - feature_t0) * 1000, 2)
-                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'fpga','progress':85,'message':'Running FPGA inference'}))
+                        # Ambil nilai mos0..mos15 (mV) dari dictionary rows
+                        recording = []
+                        for r in rows:
+                            row_mos = [float(r.get(f"mos{i}", r.get(f"mos{i}_mV", r.get(f"MOS{i}", 0.0)))) for i in range(16)]
+                            recording.append(row_mos)
+
+                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'fpga','progress':50,'message':'Running SNN Rust Inference'}))
                         loop = asyncio.get_running_loop()
-                        result = await loop.run_in_executor(None, snn_fpga_inference_safe, values)
-                        result['feature_latency_ms'] = feature_latency_ms
+                        result = await loop.run_in_executor(None, snn_rust_inference, recording)
                         result['total_latency_ms'] = round((time.monotonic() - request_t0) * 1000, 2)
+                        
+                        # Baca snapshot daya Kria saat inferensi selesai
+                        try:
+                            with open("/sys/class/hwmon/hwmon0/power1_input", "r") as f:
+                                result['kria_power_w'] = round(float(f.read().strip()) / 1e6, 3)
+                            with open("/sys/class/hwmon/hwmon0/in1_input", "r") as f:
+                                result['kria_vbus_v'] = round(float(f.read().strip()) / 1000.0, 3)
+                            with open("/sys/class/hwmon/hwmon0/curr1_input", "r") as f:
+                                result['kria_current_a'] = round(float(f.read().strip()) / 1000.0, 3)
+                        except Exception:
+                            result['kria_power_w'] = None
+
                         result['type'] = 'SNN_RESULT'
                         await websocket.send(json.dumps(result))
 
@@ -683,7 +667,7 @@ def serial_read_loop(loop, outbound_queue):
     persist_queue = queue.Queue(maxsize=2048)
 
     def _persist_writer():
-        """Drain persist_queue → persister_proc.stdin in a separate thread
+        """Drain persist_queue -> persister_proc.stdin in a separate thread
         so blocking flush() never stalls the USB read loop."""
         while not shutdown_event.is_set():
             try:
@@ -730,6 +714,17 @@ def serial_read_loop(loop, outbound_queue):
                                 loop.call_soon_threadsafe(_resolve_phase_ack, phase_ack.group(1))
                             if decoded == "SYSTEM_WATCHDOG=TRIPPED":
                                 loop.call_soon_threadsafe(_abort_system_after_watchdog)
+                            if decoded.startswith("SAMPLE,"):
+                                try:
+                                    flds = decoded.split(",")
+                                    # Format SAMPLE: timestamp, cycle?, mos0..mos15, ...
+                                    # Sensor MOS ada di urutan kolom sensor
+                                    start_idx = 2 if len(flds) >= 35 else 1
+                                    mos_vals = [float(x) for x in flds[start_idx:start_idx+16]]
+                                    if len(mos_vals) == 16:
+                                        update_sensor_history(mos_vals)
+                                except Exception:
+                                    pass
                             # Enqueue for persistence (non-blocking)
                             try:
                                 persist_queue.put_nowait(decoded)

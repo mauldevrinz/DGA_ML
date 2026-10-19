@@ -2,12 +2,12 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Play, Square, Activity, Cpu, Upload, Wifi, WifiOff, Zap, ThermometerSun, AlertTriangle, CheckCircle2, Clock, Wind, Flame, Droplets } from 'lucide-react';
 import './Classification.css';
 
-// Gas composition labels — matches training code (colab/DGA_ML_GasComposition_Training.py)
-const GAS_NAMES   = ['AIR', 'C₂H₂', 'C₂H₄', 'H₂', 'CH₄'];
-const GAS_KEYS    = ['AIR', 'C2H2', 'C2H4', 'H2', 'CH4'];   // keys from backend JSON
-const GAS_LABELS  = ['Udara Bersih', 'Asetilena', 'Etilena', 'Hidrogen', 'Metana'];
-const GAS_COLORS  = ['#10b981', '#ef4444', '#f97316', '#8b5cf6', '#eab308'];
-const GAS_ICONS   = [Wind, Zap, Flame, Droplets, Activity];
+// Gas composition labels — matches new training model (C2H2, C2H4, CH4, H2, OTHER)
+const GAS_NAMES   = ['C₂H₂', 'C₂H₄', 'CH₄', 'H₂', 'OTHER'];
+const GAS_KEYS    = ['C2H2', 'C2H4', 'CH4', 'H2', 'OTHER'];   // keys from backend JSON
+const GAS_LABELS  = ['Acetylene', 'Ethylene', 'Methane', 'Hydrogen', 'Other Gases / Normal'];
+const GAS_COLORS  = ['#ef4444', '#f97316', '#eab308', '#8b5cf6', '#10b981'];
+const GAS_ICONS   = [Zap, Flame, Activity, Droplets, Wind];
 
 // IEC severity → color mapping (diagnosis comes from backend now)
 const SEVERITY_STYLE = {
@@ -38,6 +38,7 @@ const Classification = () => {
   const [errorMsg, setErrorMsg] = useState('');
   const [csvProgress, setCsvProgress] = useState(null);
   const [csvDialog, setCsvDialog] = useState(null);
+  const [kriaPower, setKriaPower] = useState(null); // { v, i, p }
 
   const showDialog = useCallback((message, title = 'CSV Prediction') => {
     setCsvDialog({ title, message });
@@ -75,19 +76,25 @@ const Classification = () => {
                 const gas = Object.entries(json.gas_confidences || {});
                 const gasText = gas.map(([name, value]) => `${name}: ${value}%`).join('\n');
                 const diagnosis = json.iec_diagnosis || {};
-                showDialog(`CSV Prediction
+                const powerText = json.kria_power_w != null ? `${json.kria_power_w} W (${json.kria_vbus_v}V, ${json.kria_current_a}A)` : "N/A";
+                showDialog(`=== TRANSFORMER OIL PREDICTION RESULT ===
 
-Fault class: ${diagnosis.fault_code || ' '} - ${diagnosis.fault_type || ' '}
-Severity: ${diagnosis.severity || ' '}
+1. OIL FAULT CLASSIFICATION:
+   Status / Code : ${json.predicted_fault || diagnosis.fault_code || "Normal"} (${diagnosis.fault_type || "No Fault"})
+   Severity      : ${diagnosis.severity ? diagnosis.severity.toUpperCase() : "NORMAL"}
+   Description   : ${diagnosis.description || "Oil condition is normal"}
 
-Gas composition:
+2. DISSOLVED GAS COMPOSITION (SNN OUTPUT):
 ${gasText}
+   Dominant      : ${json.predicted_gas || "—"} (${((json.confidence || 0) * 100).toFixed(1)}%)
 
-Dominant: ${json.predicted_gas || ' '} (${((json.confidence || 0) * 100).toFixed(1)}%)
+3. LATENCY & PERFORMANCE METRICS:
+   Feature Extraction : ${json.feature_latency_ms ?? "—"} ms
+   SNN Inference      : ${json.latency_ms ?? "—"} ms
+   Total Latency      : ${json.total_latency_ms ?? "—"} ms
 
-Feature extraction: ${json.feature_latency_ms ?? ' '} ms
-FPGA inference: ${json.latency_ms ?? ' '} ms
-Total latency: ${json.total_latency_ms ?? ' '} ms`);
+4. BOARD POWER CONSUMPTION (KRIA KV260):
+   Actual Power  : ${powerText}`);
               } else {
                 showDialog(`CSV Prediction failed
 
@@ -105,6 +112,7 @@ ${json.error || 'Unknown FPGA error'}`);
                 predicted_gas: json.predicted_gas,
                 predicted_idx: json.predicted_idx,
                 confidence: json.confidence,
+                predicted_fault: json.predicted_fault,
                 latency_ms: json.latency_ms,
                 outputs: json.outputs,
                 gas_confidences: json.gas_confidences,
@@ -116,6 +124,15 @@ ${json.error || 'Unknown FPGA error'}`);
             }
           }
         } catch (_) { /* ignore non-JSON */ }
+        return;
+      }
+
+      // Parse KRIA power monitoring telemetry
+      if (typeof line === 'string' && line.startsWith('KRIA Vbus=')) {
+        const m = line.match(/KRIA Vbus=(-?[0-9.]+)V I=(-?[0-9.]+)A P=(-?[0-9.]+)W/);
+        if (m) {
+          setKriaPower({ v: m[1], i: m[2], p: m[3] });
+        }
         return;
       }
 
@@ -242,7 +259,7 @@ ${json.error || 'Unknown FPGA error'}`);
       // Parse header to find sensor columns
       const header = lines[0].split(',').map(h => h.trim());
       const dataLines = lines.slice(1);
-      const rows = dataLines.slice(0, 288).map(line => {
+      const rows = dataLines.map(line => {
         const cols = line.split(',');
         return Object.fromEntries(header.map((name, i) => [name, parseFloat(cols[i]) || 0]));
       });
@@ -251,7 +268,7 @@ ${json.error || 'Unknown FPGA error'}`);
         if (csvWs && csvWs.readyState === WebSocket.OPEN) {
           csvModeRef.current = true;
           csvWs.send(JSON.stringify({ type: 'SNN_CSV_INFER', rows }));
-          showDialog(`CSV submitted for inference: ${rows.length}/288 rows.`);
+          showDialog(`CSV submitted for inference: ${rows.length} rows.`);
           return;
         }
         if (attempt < 10) {
@@ -300,12 +317,30 @@ ${json.error || 'Unknown FPGA error'}`);
 
   return (
     <div className="page-container">
-      {(csvProgress || csvDialog) && (<div role="dialog" aria-modal="true" style={{ position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, background: 'rgba(2, 6, 23, 0.72)' }}>
-        <div style={{ width: 'min(560px, 100%)', maxHeight: '80vh', overflowY: 'auto', padding: 22, borderRadius: 14, background: '#172554', color: '#fff' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 14, borderBottom: '1px solid rgba(255,255,255,.14)' }}><div><div style={{ color: '#7dd3fc', fontSize: 11, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase' }}>Inference result</div><h3 style={{ margin: '4px 0 0', color: '#fff', fontSize: 20 }}>{csvDialog?.title || 'CSV Prediction'}</h3></div><button type="button" onClick={() => { setCsvDialog(null); setCsvProgress(null); csvModeRef.current = false; }} aria-label="Close" style={{ color: '#fff', background: 'rgba(255,255,255,.12)', border: '1px solid rgba(255,255,255,.22)', borderRadius: 8, width: 32, height: 32, cursor: 'pointer', fontSize: 18 }}>x</button></div>
-          {csvProgress && csvProgress.progress < 100 && <div style={{ marginTop: 18, padding: 14, borderRadius: 10, background: 'rgba(15,23,42,.55)' }}><div style={{ color: '#fff', fontSize: 13, marginBottom: 10 }}>{csvProgress.message}</div><div style={{ height: 9, background: '#334155', borderRadius: 99, overflow: 'hidden' }}><div style={{ width: '100%', height: '100%', background: 'linear-gradient(90deg,#38bdf8,#10b981)', borderRadius: 99 }} /></div><div style={{ color: '#cbd5e1', fontSize: 11, marginTop: 7, textAlign: 'right' }}>{csvProgress.progress}%</div></div>}
-          {csvDialog?.message && <pre style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6, color: '#fff', fontFamily: 'inherit', fontSize: 13, margin: '18px 0' }}>{csvDialog.message}</pre>}
-          {csvDialog && <button type="button" onClick={() => { setCsvDialog(null); setCsvProgress(null); csvModeRef.current = false; }} style={{ color: '#fff', background: '#0ea5e9', border: 0, borderRadius: 8, padding: '10px 22px', fontWeight: 700, cursor: 'pointer', width: '100%' }}>Close</button>}
+      {(csvProgress || csvDialog) && (<div role="dialog" aria-modal="true" style={{ position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20, backgroundColor: 'rgba(15, 23, 42, 0.65)', backdropFilter: 'blur(4px)' }}>
+        <div style={{ width: 'min(580px, 100%)', maxHeight: '85vh', overflowY: 'auto', padding: 28, borderRadius: 16, backgroundColor: '#ffffff', color: '#0f172a', border: '1px solid #e2e8f0', boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.35)' }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', paddingBottom: 14, borderBottom: '1px solid #e2e8f0' }}>
+            <div>
+              <div style={{ color: '#0284c7', fontSize: 11, fontWeight: 700, letterSpacing: 1.2, textTransform: 'uppercase' }}>Inference result</div>
+              <h3 style={{ margin: '4px 0 0', color: '#0f172a', fontSize: 20, fontWeight: 700 }}>{csvDialog?.title || 'CSV Prediction'}</h3>
+            </div>
+            <button type="button" onClick={() => { setCsvDialog(null); setCsvProgress(null); csvModeRef.current = false; }} aria-label="Close" style={{ color: '#64748b', background: '#f1f5f9', border: '1px solid #cbd5e1', borderRadius: 8, width: 32, height: 32, cursor: 'pointer', fontSize: 18, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>✕</button>
+          </div>
+          {csvProgress && csvProgress.progress < 100 && (
+            <div style={{ marginTop: 18, padding: 14, borderRadius: 10, backgroundColor: '#f8fafc', border: '1px solid #e2e8f0' }}>
+              <div style={{ color: '#334155', fontSize: 13, marginBottom: 8, fontWeight: 500 }}>{csvProgress.message}</div>
+              <div style={{ height: 8, backgroundColor: '#e2e8f0', borderRadius: 99, overflow: 'hidden' }}>
+                <div style={{ width: `${csvProgress.progress}%`, height: '100%', background: 'linear-gradient(90deg, #0284c7, #10b981)', borderRadius: 99, transition: 'width 0.3s ease' }} />
+              </div>
+              <div style={{ color: '#64748b', fontSize: 11, marginTop: 6, textAlign: 'right', fontWeight: 600 }}>{csvProgress.progress}%</div>
+            </div>
+          )}
+          {csvDialog?.message && (
+            <pre style={{ whiteSpace: 'pre-wrap', lineHeight: 1.6, color: '#1e293b', backgroundColor: '#f8fafc', padding: 16, borderRadius: 10, border: '1px solid #e2e8f0', fontFamily: 'monospace', fontSize: 13, margin: '18px 0' }}>{csvDialog.message}</pre>
+          )}
+          {csvDialog && (
+            <button type="button" onClick={() => { setCsvDialog(null); setCsvProgress(null); csvModeRef.current = false; }} style={{ color: '#fff', background: '#0284c7', border: 0, borderRadius: 8, padding: '11px 22px', fontWeight: 700, fontSize: 14, cursor: 'pointer', width: '100%', transition: 'background 0.2s' }}>Close</button>
+          )}
         </div>
       </div>)}
 
@@ -348,7 +383,19 @@ ${json.error || 'Unknown FPGA error'}`);
             }}>
               <Activity size={14} color="#75BDE0" />
               <span style={{ color: '#fff', fontSize: '12px' }}>
-                Inferences: <strong>{inferenceCount}</strong>
+                 Inferences: <strong>{inferenceCount}</strong>
+              </span>
+            </div>
+          )}
+          {kriaPower && (
+            <div style={{
+              display: 'flex', gap: '8px', alignItems: 'center',
+              backgroundColor: '#243F81', padding: '6px 14px', borderRadius: '24px',
+              border: '1px solid rgba(16, 185, 129, 0.4)',
+            }}>
+              <Zap size={14} color="#10b981" />
+              <span style={{ color: '#fff', fontSize: '12px' }}>
+                Kria Power: <strong style={{ color: '#10b981' }}>{kriaPower.p} W</strong> ({kriaPower.v}V, {kriaPower.i}A)
               </span>
             </div>
           )}
@@ -451,7 +498,7 @@ ${json.error || 'Unknown FPGA error'}`);
               <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '12px' }}>
                 {history.map((h, i) => {
                   const color = GAS_COLORS[h.predicted_idx] || '#94a3b8';
-                  const iecCode = h.iec_diagnosis?.fault_code || '—';
+                  const faultCode = h.predicted_fault || h.iec_diagnosis?.fault_code || '—';
                   return (
                     <div key={i} style={{
                       display: 'flex', justifyContent: 'space-between', alignItems: 'center',
@@ -462,8 +509,8 @@ ${json.error || 'Unknown FPGA error'}`);
                       <span style={{ fontWeight: 'bold', color, fontSize: '13px', flex: 1, textAlign: 'center' }}>
                         {h.predicted_gas}
                       </span>
-                      <span style={{ fontSize: '11px', color: '#cbd5e1', minWidth: '40px', textAlign: 'center' }}>
-                        {iecCode}
+                      <span style={{ fontSize: '11px', color: '#cbd5e1', minWidth: '55px', textAlign: 'center', fontWeight: 600 }}>
+                        {faultCode}
                       </span>
                       <span style={{ fontSize: '11px', color: '#94a3b8', minWidth: '55px', textAlign: 'right' }}>
                         {h.latency_ms} ms
@@ -506,7 +553,7 @@ ${json.error || 'Unknown FPGA error'}`);
                     backgroundColor: 'rgba(255,255,255,0.1)', padding: '4px 14px',
                     borderRadius: '16px', fontSize: '14px', color: '#75BDE0',
                   }}>
-                    Dominan: {(snnResult.confidence * 100).toFixed(1)}%
+                    Dominant: {(snnResult.confidence * 100).toFixed(1)}%
                   </span>
                   {currentDiag && (
                     <>
@@ -514,7 +561,7 @@ ${json.error || 'Unknown FPGA error'}`);
                         backgroundColor: 'rgba(255,255,255,0.1)', padding: '4px 14px',
                         borderRadius: '16px', fontSize: '14px', color: '#fff', fontWeight: 'bold',
                       }}>
-                        IEC 60599: {currentDiag.fault_code}
+                        Oil Fault: {snnResult.predicted_fault || currentDiag.fault_code}
                       </span>
                       <span style={{
                         backgroundColor: (SEVERITY_STYLE[currentDiag.severity] || SEVERITY_STYLE.normal).bg,
@@ -574,7 +621,7 @@ ${json.error || 'Unknown FPGA error'}`);
                             fontSize: '10px', backgroundColor: color + '30', color: color,
                             padding: '2px 8px', borderRadius: '10px', fontWeight: 700,
                           }}>
-                            DOMINAN
+                            DOMINANT
                           </span>
                         )}
                       </span>

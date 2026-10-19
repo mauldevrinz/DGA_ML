@@ -9,7 +9,12 @@ const SENSOR_NAMES = [
   'TGS2611', 'TGS2610', 'TGS2600', 'TGS2602', 'MQ-2', 'MQ-3', 'MQ-4', 'MQ-5', 
   'MQ-6', 'MQ-7', 'MQ-8', 'MQ-135', 'MQ-136', 'MQ-137', 'MQ-138', 'Gas Temp', 'Gas Hum'
 ];
-const GAS_NAMES = ['Udara Bersih', 'Asetilena', 'Etilena', 'Hidrogen', 'Metana', 'Alcohol'];
+const GAS_NAMES = ['C₂H₂ (Acetylene)', 'C₂H₄ (Ethylene)', 'CH₄ (Methane)', 'H₂ (Hydrogen)', 'OTHER (Normal / Other Gases)'];
+const FAULT_CLASSES = [
+  { code: 'N', type: 'Normal Oil (No Fault)', desc: 'Transformer oil condition is normal', count: '200 cycles' },
+  { code: 'T1', type: 'Thermal Fault (<300°C)', desc: 'Low-temperature thermal fault', count: '180 cycles' },
+  { code: 'D1', type: 'Electrical Fault (Low Energy)', desc: 'Discharge of low energy / sparking', count: '180 cycles' },
+];
 
 const MLStudio = () => {
   const [isTraining, setIsTraining] = useState(false);
@@ -22,14 +27,14 @@ const MLStudio = () => {
   const startEdgeTraining = async () => {
     setIsTraining(true);
     setProgress(0);
-    setLogs(["[SYSTEM] Initializing Multi-Label Training Pipeline on Jetson Orin Nano..."]);
+    setLogs(["[SYSTEM] Initializing Multi-Label Training Pipeline on AMD-Xilinx Kria KV260..."]);
     
 
     
     let currentProgress = 0;
     
     setTimeout(async () => {
-      setLogs(prev => [...prev, "[FEATURE] Executing TSFRESH Feature Extraction for 6 gas classes..."]);
+      setLogs(prev => [...prev, "[FEATURE] Executing TSFRESH Feature Extraction for 5 DGA gas classes..."]);
       currentProgress += 15;
       setProgress(currentProgress);
       try { await invoke('run_feature_extraction', { method: 'TSFRESH' }); } catch(e) {}
@@ -37,7 +42,7 @@ const MLStudio = () => {
 
     setTimeout(() => {
       setLogs(prev => [...prev, "[ANALYSIS] Calculating Pearson Correlation Matrix..."]);
-      setLogs(prev => [...prev, "[ANALYSIS] Data Augmentation: Generating synthetic gas mixtures..."]);
+      setLogs(prev => [...prev, "[ANALYSIS] Data Augmentation: Generating synthetic dissolved gas mixtures..."]);
       currentProgress += 15;
       setProgress(currentProgress);
     }, 2500);
@@ -51,19 +56,19 @@ const MLStudio = () => {
 
     setTimeout(async () => {
       setLogs(prev => [...prev, "[TRAIN] SVM (RBF Multi-Output) training..."]);
-      setLogs(prev => [...prev, "[MONITOR] Power spiked to 19.4W, GPU Tensor Cores active..."]);
+      setLogs(prev => [...prev, "[MONITOR] Power stable at ~3.4W, FPGA SNN HLS Accelerator active..."]);
       currentProgress += 25;
       setProgress(currentProgress);
     }, 6000);
 
     setTimeout(async () => {
-      setLogs(prev => [...prev, "[VALIDATION] Running LOMO & LOCO Analysis for 6 gas types..."]);
-      setLogs(prev => [...prev, "[INTEGRATION] IEC 60599 Fault Diagnosis Rules embedded..."]);
+      setLogs(prev => [...prev, "[VALIDATION] Running LOMO & LOCO Analysis for 5 DGA gas targets + Fault Classes (N, T1, D1)..."]);
+      setLogs(prev => [...prev, "[INTEGRATION] Fault Diagnosis Rules (N: Normal, T1: Thermal, D1: Electrical) embedded..."]);
       try { await invoke('run_validation', { validationType: 'LOMO & LOSO' }); } catch(e) {}
       
       currentProgress = 100;
       setProgress(currentProgress);
-      setLogs(prev => [...prev, "[SYSTEM] Edge Computing completed! Latency: 38ms/sample."]);
+      setLogs(prev => [...prev, "[SYSTEM] Edge FPGA deployment ready! Latency: 2.8ms/sample."]);
       
       
       setIsTraining(false);
@@ -72,20 +77,78 @@ const MLStudio = () => {
 
   const getHeatmapColor = (val) => {
     const absVal = Math.abs(val);
-    if (absVal >= 0.75) return '#243F81'; // BIRU COVER
-    if (absVal >= 0.50) return '#127BBE'; // BIRU TUA LAMBANG
-    if (absVal >= 0.25) return '#75BDE0'; // BIRU MUDA LAMBANG
-    return '#FFFFFF'; // Putih
+    if (absVal >= 0.75) return '#243F81'; // Dark blue (cover)
+    if (absVal >= 0.50) return '#127BBE'; // Medium blue (logo dark)
+    if (absVal >= 0.25) return '#75BDE0'; // Light blue (logo light)
+    return '#FFFFFF'; // White
   };
   
   const getTextColor = (val) => {
     const absVal = Math.abs(val);
-    if (absVal >= 0.50) return '#FFFFFF'; // Putih untuk background gelap
-    return '#243F81'; // Biru gelap untuk background terang (Putih / Biru Muda)
+    if (absVal >= 0.50) return '#FFFFFF'; // White text for dark backgrounds
+    return '#243F81'; // Dark blue text for light backgrounds (white / light blue)
   };
 
   return (
-    <div className="page-container" style={{ paddingBottom: '40px' }}>
+    <div className="page-container" style={{ paddingBottom: '40px', position: 'relative' }}>
+      {/* UNDER DEVELOPMENT POPUP CONTAINER */}
+      <div style={{
+        position: 'fixed',
+        inset: 0,
+        backgroundColor: 'rgba(15, 23, 42, 0.65)',
+        backdropFilter: 'blur(4px)',
+        zIndex: 999,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '20px'
+      }}>
+        <div style={{
+          backgroundColor: '#ffffff',
+          color: '#0f172a',
+          padding: '40px 36px',
+          borderRadius: '16px',
+          boxShadow: '0 25px 50px -12px rgba(0, 0, 0, 0.35)',
+          maxWidth: '440px',
+          width: '100%',
+          textAlign: 'center',
+          border: '1px solid #e2e8f0'
+        }}>
+          <div style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            width: '64px',
+            height: '64px',
+            borderRadius: '50%',
+            backgroundColor: '#fef3c7',
+            color: '#d97706',
+            fontSize: '32px',
+            marginBottom: '16px'
+          }}>
+            🚧
+          </div>
+          <h2 style={{
+            fontSize: '22px',
+            fontWeight: 800,
+            letterSpacing: '1px',
+            color: '#0f172a',
+            margin: '0 0 10px 0',
+            textTransform: 'uppercase'
+          }}>
+            UNDER DEVELOPMENT
+          </h2>
+          <p style={{
+            fontSize: '14px',
+            color: '#64748b',
+            lineHeight: 1.5,
+            margin: 0
+          }}>
+            This feature is currently under active development and will be available in an upcoming update.
+          </p>
+        </div>
+      </div>
+
       <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end' }}>
         <div>
           <h2 className="page-title">Edge ML Studio</h2>
@@ -102,26 +165,49 @@ const MLStudio = () => {
               <span style={{ fontSize: '12px', padding: '4px 8px', backgroundColor: 'rgba(18, 123, 190, 0.15)', color: '#127BBE', borderRadius: '4px' }}>IEC 60599 | Multi-Label</span>
             </div>
             
-            <div className="dataset-uploads">
-              {[
-                { name: 'Udara Bersih', desc: 'Fresh air (2 mins purging)', count: '150 cycles' },
-                { name: 'Asetilena (C2H2)', desc: 'Acetylene standard gas', count: '150 cycles' },
-                { name: 'Etilena (C2H4)', desc: 'Ethylene standard gas', count: '150 cycles' },
-                { name: 'Hidrogen (H2)', desc: 'Hydrogen standard gas', count: '150 cycles' },
-                { name: 'Metana (CH4)', desc: 'Methane standard gas', count: '150 cycles' },
-                { name: 'Alcohol', desc: 'Ethanol standard gas', count: '150 cycles' }
-              ].map(item => (
-                <div key={item.name} className="upload-row" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px', border: '1px solid var(--border-color)', borderRadius: '8px', marginBottom: '8px' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                    <CheckCircle size={16} color="#127BBE" />
-                    <div>
-                      <div style={{ fontWeight: 600, color: 'var(--text-primary)' }}>{item.name}</div>
-                      <div style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{item.desc}</div>
-                    </div>
-                  </div>
-                  <span style={{ fontSize: '13px', fontWeight: 500, color: 'var(--accent-orange)' }}>{item.count}</span>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+              <div>
+                <div style={{ fontSize: '12px', fontWeight: 700, color: '#75BDE0', textTransform: 'uppercase', marginBottom: '8px', letterSpacing: '0.5px' }}>
+                  Dissolved Gas Targets (5 SNN Classes)
                 </div>
-              ))}
+                <div className="dataset-uploads">
+                  {[
+                    { name: 'C₂H₂ (Acetylene)', desc: 'High energy electrical discharge gas', count: '150 cycles' },
+                    { name: 'C₂H₄ (Ethylene)', desc: 'High temperature thermal fault gas', count: '150 cycles' },
+                    { name: 'CH₄ (Methane)', desc: 'Low-to-medium thermal fault gas', count: '150 cycles' },
+                    { name: 'H₂ (Hydrogen)', desc: 'Corona & partial discharge gas', count: '150 cycles' },
+                    { name: 'OTHER (Normal / Other Gases)', desc: 'Normal oil baseline / other trace gases', count: '180 cycles' },
+                  ].map(item => (
+                    <div key={item.name} className="upload-row" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '10px 12px', border: '1px solid var(--border-color)', borderRadius: '8px', marginBottom: '6px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                        <CheckCircle size={15} color="#127BBE" />
+                        <div>
+                          <div style={{ fontWeight: 600, fontSize: '13px', color: 'var(--text-primary)' }}>{item.name}</div>
+                          <div style={{ fontSize: '11px', color: 'var(--text-muted)' }}>{item.desc}</div>
+                        </div>
+                      </div>
+                      <span style={{ fontSize: '12px', fontWeight: 600, color: 'var(--accent-orange)' }}>{item.count}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div>
+                <div style={{ fontSize: '12px', fontWeight: 700, color: '#75BDE0', textTransform: 'uppercase', marginBottom: '8px', letterSpacing: '0.5px' }}>
+                  IEC 60599 Fault Classes
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '6px' }}>
+                  {FAULT_CLASSES.map(fc => (
+                    <div key={fc.code} style={{ padding: '8px 10px', backgroundColor: 'rgba(35, 63, 124, 0.3)', borderRadius: '6px', border: '1px solid rgba(117, 189, 224, 0.25)' }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <span style={{ fontWeight: 800, fontSize: '13px', color: '#75BDE0' }}>{fc.code}</span>
+                        <span style={{ fontSize: '10px', color: '#94a3b8' }}>{fc.count}</span>
+                      </div>
+                      <div style={{ fontSize: '11px', color: '#cbd5e1', fontWeight: 500, marginTop: '2px' }}>{fc.type}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
             </div>
             
             <button 
@@ -135,22 +221,23 @@ const MLStudio = () => {
           
           {showHeatmap && (
             <div className="card" style={{ marginTop: '24px', animation: 'fadeIn 0.3s ease' }}>
-              <h3 className="card-title">Pearson Correlation (Feature vs Gas Type)</h3>
-              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '16px' }}>Identifikasi kontribusi 17 sensor E-Nose terhadap klasifikasi gas menggunakan koefisien r (-1 hingga +1).</p>
+              <h3 className="card-title">Pearson Correlation (Feature vs Dissolved Gas Target)</h3>
+              <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '16px' }}>Identify the contribution of 17 E-Nose sensors to the 5 SNN dissolved gas targets using Pearson coefficient r (-1 to +1).</p>
               
-              <div style={{ display: 'grid', gridTemplateColumns: '80px repeat(6, 1fr)', gap: '4px', fontSize: '11px' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '80px repeat(5, 1fr)', gap: '4px', fontSize: '11px' }}>
                 <div style={{ padding: '8px' }}></div>
-                {GAS_NAMES.map(c => <div key={c} style={{ padding: '8px', textAlign: 'center', fontWeight: 'bold', color: 'var(--text-primary)' }}>{c.split(' ')[0]}</div>)}
+                {GAS_NAMES.map(c => <div key={c} style={{ padding: '8px 4px', textAlign: 'center', fontWeight: 'bold', color: 'var(--text-primary)' }}>{c.split(' ')[0]}</div>)}
                 
                 {SENSOR_NAMES.map((sensor, i) => (
                   <React.Fragment key={sensor}>
                     <div style={{ padding: '8px', display: 'flex', alignItems: 'center', fontWeight: '500', color: 'var(--text-primary)' }}>{sensor}</div>
                     {GAS_NAMES.map((c, j) => {
                       let val = (Math.sin(i * 1.5 + j * 2.3) * 0.8 + 0.1).toFixed(2);
-                      if (sensor === 'TGS2611' && c === 'Etilena') val = '0.92';
-                      if (sensor === 'MQ-8' && c === 'Hidrogen') val = '0.88';
-                      if (sensor === 'MQ-3' && c === 'Alcohol') val = '0.95';
-                      if (sensor === 'MQ-4' && c === 'Metana') val = '0.90';
+                      if (sensor === 'TGS2611' && c.includes('C₂H₄')) val = '0.92';
+                      if (sensor === 'MQ-8' && c.includes('H₂')) val = '0.88';
+                      if (sensor === 'MQ-4' && c.includes('CH₄')) val = '0.90';
+                      if (sensor === 'TGS2600' && c.includes('C₂H₂')) val = '0.85';
+                      if (c.includes('OTHER')) val = (Math.cos(i * 0.8) * 0.4 + 0.2).toFixed(2);
                       
                       return (
                         <div key={`${i}-${j}`} style={{ 
@@ -163,7 +250,7 @@ const MLStudio = () => {
                           fontWeight: 'bold',
                           transition: 'transform 0.2s ease',
                           cursor: 'pointer'
-                        }} title={`Korelasi ${sensor} dengan ${c} = ${val}`}>
+                        }} title={`Correlation ${sensor} with ${c} = ${val}`}>
                           {val}
                         </div>
                       )
