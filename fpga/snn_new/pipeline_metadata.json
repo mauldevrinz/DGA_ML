@@ -1,0 +1,51 @@
+{
+  "gas_training_files": 112,
+  "gas_independent_sessions": 112,
+  "fault_training_files": 43,
+  "fault_independent_sessions": 7,
+  "unseen_files": 7,
+  "feature_count": 37,
+  "gas_models_evaluated": [
+    "SNN",
+    "SVM",
+    "RandomForest"
+  ],
+  "gas_model_exported": "SNN",
+  "gas_cv_models_compared": [
+    "SNN",
+    "SVM",
+    "RandomForest"
+  ],
+  "fault_model_exported": "RandomForest",
+  "regularization": {
+    "SNN_hidden": 24,
+    "SNN_weight_decay": 0.001,
+    "gas_max_features_per_fold": "one-third of independent training sessions",
+    "RF_gas_max_depth": 8,
+    "RF_fault_max_depth": 3,
+    "RF_min_samples_leaf": 2
+  },
+  "synthetic_augmentation": false,
+  "evaluations": [
+    "session-grouped 80/20 holdout for reporting",
+    "session-grouped 5-fold CV for SNN/SVM/RandomForest",
+    "session-grouped LOMO for SNN",
+    "LOCO MOS channel ablation for SNN"
+  ],
+  "fault_evaluations": [
+    "session holdout",
+    "LOMO session"
+  ],
+  "gas_classes": [
+    "C2H2",
+    "C2H4",
+    "CH4",
+    "H2",
+    "OTHER"
+  ],
+  "fault_classes": [
+    "T1",
+    "D1",
+    "N"
+  ]
+}
