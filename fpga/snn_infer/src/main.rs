@@ -33,12 +33,17 @@ use std::time::Instant;
 
 #[derive(Deserialize)]
 struct InputRequest {
-    recording: Vec<Vec<f64>>,
+    #[serde(default)]
+    recording: Option<Vec<Vec<f64>>>,
+    #[serde(default)]
+    features: Option<Vec<f64>>,
+    #[serde(default)]
+    feature_ms: Option<f64>,
     #[serde(default)]
     use_hw: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
 struct OutputResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,11 +59,15 @@ struct OutputResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     confidence: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    outputs: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     predicted_fault: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     feature_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     latency_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_features: Option<Vec<f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
 }
@@ -96,7 +105,7 @@ fn main() {
                 predicted_fault: None,
                 feature_ms: None,
                 latency_ms: None,
-                mode: None,
+                ..Default::default()
             };
             println!("{}", serde_json::to_string(&resp).unwrap());
             return;
@@ -117,7 +126,7 @@ fn main() {
                 predicted_fault: None,
                 feature_ms: None,
                 latency_ms: None,
-                mode: None,
+                ..Default::default()
             };
             println!("{}", serde_json::to_string(&resp).unwrap());
             return;
@@ -143,34 +152,18 @@ fn main() {
                 let resp = OutputResponse {
                     ok: false,
                     error: Some(format!("Invalid JSON input: {}", e)),
-                    gas_names: None,
-                    gas_confidences: None,
-                    predicted_gas: None,
-                    predicted_idx: None,
-                    confidence: None,
-                    predicted_fault: None,
-                    feature_ms: None,
-                    latency_ms: None,
-                    mode: None,
+                    ..Default::default()
                 };
                 println!("{}", serde_json::to_string(&resp).unwrap());
                 continue;
             }
         };
 
-        if req.recording.is_empty() {
+        if req.features.is_none() && req.recording.as_ref().map_or(true, Vec::is_empty) {
             let resp = OutputResponse {
                 ok: false,
                 error: Some("Recording data is empty".to_string()),
-                gas_names: None,
-                gas_confidences: None,
-                predicted_gas: None,
-                predicted_idx: None,
-                confidence: None,
-                predicted_fault: None,
-                feature_ms: None,
-                latency_ms: None,
-                mode: None,
+                ..Default::default()
             };
             println!("{}", serde_json::to_string(&resp).unwrap());
             continue;
@@ -178,18 +171,35 @@ fn main() {
 
         // 1. Ekstraksi 37 fitur tsfresh
         let t_feat_start = Instant::now();
-        let raw_features = features::compute_all(&req.recording);
-        let feature_ms = t_feat_start.elapsed().as_secs_f64() * 1000.0;
+        let raw_features: [f64; 37] = if let Some(features) = req.features {
+            if features.len() != 37 {
+                let resp = OutputResponse {
+                    ok: false,
+                    error: Some(format!("Expected 37 Python-extracted features, received {}", features.len())),
+                    ..Default::default()
+                };
+                println!("{}", serde_json::to_string(&resp).unwrap());
+                continue;
+            }
+            let mut values = [0.0; 37];
+            values.copy_from_slice(&features);
+            values
+        } else {
+            features::compute_all(req.recording.as_ref().unwrap())
+        };
+        let feature_ms = req.feature_ms.unwrap_or_else(|| t_feat_start.elapsed().as_secs_f64() * 1000.0);
 
         // 2. Inferensi SNN Gas (HW atau SW)
         let t_infer_start = Instant::now();
         let (logits, mode) = if req.use_hw {
-            let mut norm_feats = [0.0f32; 37];
+            // Match fpga/snn_new/snn_kria.py: HLS receives raw tsfresh features;
+            // normalization is part of the FPGA model path. The SW path normalizes in snn::infer.
+            let mut raw_feats = [0.0f32; 37];
             for i in 0..37 {
                 let val = if raw_features[i].is_finite() { raw_features[i] } else { weights.impute[i] };
-                norm_feats[i] = (val as f32 - weights.mean[i]) * weights.inv_scale[i];
+                raw_feats[i] = val as f32;
             }
-            match fpga::infer_hw(&norm_feats, std::time::Duration::from_millis(2000)) {
+            match fpga::infer_hw(&raw_feats, std::time::Duration::from_millis(2000)) {
                 Ok(lg) => (lg, "hw".to_string()),
                 Err(e) => {
                     let lg = snn::infer(&weights, &raw_features);
@@ -232,9 +242,11 @@ fn main() {
             predicted_gas: Some(weights.gas_classes[best_gas_idx].clone()),
             predicted_idx: Some(best_gas_idx),
             confidence: Some((best_gas_conf * 1000.0).round() / 1000.0),
+            outputs: Some(conf.to_vec()),
             predicted_fault: Some(pred_fault.to_string()),
             feature_ms: Some((feature_ms * 10.0).round() / 10.0),
             latency_ms: Some((latency_ms * 1000.0).round() / 1000.0),
+            raw_features: Some(raw_features.to_vec()),
             mode: Some(mode),
         };
 

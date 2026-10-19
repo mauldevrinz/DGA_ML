@@ -53,8 +53,9 @@ pub fn load_bitstream(bit: &Path, hwh: &Path) -> io::Result<()> {
 
 /// MMap wrapper atas /dev/mem.
 struct MemMap {
+    map_ptr: *mut u8,
     ptr:  *mut u8,
-    size: usize,
+    map_size: usize,
 }
 
 impl MemMap {
@@ -69,10 +70,14 @@ impl MemMap {
         let ptr = unsafe {
             libc_mmap(map_size, fd.as_raw_fd(), aligned as i64)
         };
-        if ptr.is_null() {
+        if ptr as isize == -1 {
             return Err(io::Error::last_os_error());
         }
-        Ok(MemMap { ptr: unsafe { ptr.add(offset) }, size })
+        Ok(MemMap {
+            map_ptr: ptr,
+            ptr: unsafe { ptr.add(offset) },
+            map_size,
+        })
     }
 
     #[inline] unsafe fn read32(&self, off: usize) -> u32 {
@@ -92,7 +97,7 @@ impl MemMap {
 }
 
 impl Drop for MemMap {
-    fn drop(&mut self) { unsafe { libc_munmap(self.ptr, self.size); } }
+    fn drop(&mut self) { unsafe { libc_munmap(self.map_ptr, self.map_size); } }
 }
 
 // Thin libc wrappers (tidak import crate libc agar dependensi minimal)
@@ -107,9 +112,9 @@ unsafe fn libc_mmap(size: usize, fd: i32, offset: i64) -> *mut u8 {
 unsafe fn libc_munmap(ptr: *mut u8, size: usize) { munmap(ptr, size); }
 
 /// Jalankan satu inferensi FPGA HW.
-/// Input: 37 float32 fitur (sudah dinormalisasi oleh akselerator / baked in).
+/// Input: 37 float32 fitur mentah dari dga_features.extract_37(), seperti snn_kria.py.
 /// Output: 5 float32 logit.
-pub fn infer_hw(features_normalized: &[f32; 37], timeout: Duration)
+pub fn infer_hw(features_raw: &[f32; 37], timeout: Duration)
     -> Result<[f32; 5], Box<dyn std::error::Error>>
 {
     // Map register IP
@@ -120,7 +125,7 @@ pub fn infer_hw(features_normalized: &[f32; 37], timeout: Duration)
 
     unsafe {
         // Tulis input ke DDR
-        x_buf.write_f32_slice(0, features_normalized);
+        x_buf.write_f32_slice(0, features_raw);
 
         // Set pointer register
         regs.write32(REG_X_LO,     (X_PHYS & 0xFFFF_FFFF) as u32);
@@ -140,11 +145,12 @@ pub fn infer_hw(features_normalized: &[f32; 37], timeout: Duration)
         // Trigger
         regs.write32(REG_CTRL, AP_START);
 
-        // Tunggu selesai (AP_DONE atau kembali ke AP_IDLE)
+        // Tunggu AP_DONE seperti driver Python. AP_IDLE bisa tetap bernilai 1
+        // tepat setelah start diterbitkan, jadi tidak cukup sebagai completion.
         let t0 = Instant::now();
         loop {
             let ctrl = regs.read32(REG_CTRL);
-            if (ctrl & AP_DONE) != 0 || (ctrl & AP_IDLE) != 0 { break; }
+            if (ctrl & AP_DONE) != 0 { break; }
             if t0.elapsed() > timeout {
                 return Err("FPGA tidak selesai (timeout)".into());
             }
@@ -154,6 +160,9 @@ pub fn infer_hw(features_normalized: &[f32; 37], timeout: Duration)
         // Baca hasil
         let mut logits = [0.0f32; 5];
         out_buf.read_f32_slice(0, &mut logits);
+        if logits.iter().any(|value| !value.is_finite()) {
+            return Err("FPGA returned non-finite logits".into());
+        }
         Ok(logits)
     }
 }

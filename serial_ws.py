@@ -6,32 +6,83 @@ import usb.core
 import usb.util
 import threading
 import queue
-import multiprocessing as mp
 import time
 import os
+import subprocess
+import sys
+import select
 import base64
 import math
 import struct
-import numpy as np
 import json
 import re
-import pandas as pd
-from tsfresh import extract_features
-from tsfresh.feature_extraction import EfficientFCParameters
-from tsfresh.utilities.dataframe_functions import impute
 
 from fuzzy_pid import FuzzyPIDController
 
-# --- SNN FPGA inference setup via Rust Binary ---
+# --- Rust SNN pipeline with FPGA hardware request ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-RUST_SNN_BIN = os.path.join(SCRIPT_DIR, "fpga", "snn_infer", "target", "release", "snn_infer")
+SNN_MODELS_DIR = os.path.join(SCRIPT_DIR, "fpga", "snn_infer", "models")
+SNN_FEATURE_SCRIPT = os.path.join(SCRIPT_DIR, "fpga", "snn_new", "extract_features.py")
+SNN_INFER_BIN = os.environ.get(
+    "SNN_INFER_BIN",
+    os.path.join(SCRIPT_DIR, "fpga", "snn_infer", "target", "release", "snn_infer"),
+)
+_gas_classes = ["C2H2", "C2H4", "CH4", "H2", "OTHER"]
+_snn_runner_lock = threading.Lock()
+_feature_worker_lock = threading.Lock()
+_feature_worker_proc = None
+
 _sensor_history = deque(maxlen=288)
 _sensor_history_lock = threading.Lock()
+_cycle_recordings = {}
+_cycle_recordings_lock = threading.Lock()
+_cycle_sample_events = {}
+_cycle_inference_launched = set()
+_cycle_inference_enabled = False
+_cycle_result_clients = set()
+_cycle_inference_tasks = set()
+_cycle_last_sequence = {}
+_cycle_overflowed = set()
+MAX_CYCLE_SAMPLES = 3600
+_cycle_inference_generation = 0
+_active_system_cycle = None
+_cycle_min_number = 1
+_stream_failure_reported = False
+ADC_COUNT_TO_MV = (4.096 / 32768.0) * 1000.0
+_kria_power_lock = threading.Lock()
+_kria_power_samples = deque(maxlen=3600)
+_kria_power_hwmon = None
+_kria_power_status = "Power sensor has not been detected"
 
 def update_sensor_history(sensor_row):
     """Keep rolling buffer of 16 MOS sensor readings (mV)."""
     with _sensor_history_lock:
         _sensor_history.append(list(sensor_row[:16]))
+
+
+def parse_sensor_sample_frame(line):
+    """Return (cycle, sequence, 16 ADC counts) from current or legacy Teensy frames."""
+    fields = line.strip().split(",")
+    if not fields or fields[0] != "SAMPLE":
+        return None
+    has_cycle_number = len(fields) == 35
+    if len(fields) > 35:
+        try:
+            cycle_candidate = float(fields[1])
+            sequence_candidate = float(fields[2])
+            has_cycle_number = 0 <= cycle_candidate <= 100 and sequence_candidate > cycle_candidate
+        except (IndexError, ValueError):
+            has_cycle_number = False
+    cycle_index, sequence_index, sensor_start = (1, 2, 3) if has_cycle_number else (None, 1, 2)
+    try:
+        cycle = int(float(fields[cycle_index])) if cycle_index is not None else 0
+        sequence = int(float(fields[sequence_index]))
+        sensor_counts = [float(value) for value in fields[sensor_start:sensor_start + 16]]
+    except (IndexError, ValueError, OverflowError):
+        return None
+    if len(sensor_counts) != 16 or not all(math.isfinite(value) for value in sensor_counts):
+        return None
+    return cycle, sequence, sensor_counts
 
 def _diagnose_iec60599(gas_confidences, predicted_fault=None):
     """
@@ -73,88 +124,122 @@ def _diagnose_iec60599(gas_confidences, predicted_fault=None):
             "description": "Dissolved gas levels within acceptable limits", "severity": "normal"}
 
 
-_snn_proc = None
-_snn_proc_lock = threading.Lock()
+def _read_worker_line(proc, timeout):
+    ready, _, _ = select.select([proc.stdout], [], [], timeout)
+    return proc.stdout.readline() if ready else None
 
-def _get_snn_proc():
-    global _snn_proc
-    if _snn_proc is None or _snn_proc.poll() is not None:
-        if not os.path.exists(RUST_SNN_BIN):
-            return None
-        _snn_proc = subprocess.Popen(
-            [RUST_SNN_BIN],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-    return _snn_proc
 
-def snn_rust_inference(recording, use_hw=False):
-    """
-    Run SNN & Fault inference using persistent daemon Rust binary snn_infer.
-    recording: list of lists [N, 16] (float values in mV).
-    """
-    global _snn_proc
+def _start_feature_worker_locked(timeout):
+    global _feature_worker_proc
+    if _feature_worker_proc is not None and _feature_worker_proc.poll() is None:
+        return _feature_worker_proc
+    _feature_worker_proc = subprocess.Popen(
+        [sys.executable, "-u", SNN_FEATURE_SCRIPT], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+    )
+    ready = _read_worker_line(_feature_worker_proc, timeout)
+    if not ready:
+        _feature_worker_proc.terminate()
+        _feature_worker_proc = None
+        raise TimeoutError("Python tsfresh worker did not become ready")
     try:
-        # Jika cuma 1 snapshot / kurang dari 3 sampel, duplikasi sedikit agar fitur time-series valid
-        if len(recording) < 5:
-            base = list(recording[-1]) if recording else [0.0]*16
-            recording = [base for _ in range(10)]
+        if not json.loads(ready).get("ready"):
+            raise RuntimeError(f"Unexpected Python tsfresh worker handshake: {ready[:200]}")
+    except Exception:
+        _feature_worker_proc.terminate()
+        _feature_worker_proc = None
+        raise
+    return _feature_worker_proc
 
-        payload = json.dumps({"recording": recording, "use_hw": use_hw})
-        t0 = time.monotonic()
 
-        with _snn_proc_lock:
-            proc = _get_snn_proc()
-            if proc is None:
-                return {"ok": False, "error": f"Rust SNN binary not found at {RUST_SNN_BIN}."}
+def warm_snn_feature_worker(timeout=60.0):
+    """Load numpy/pandas/tsfresh once during backend startup."""
+    with _feature_worker_lock:
+        _start_feature_worker_locked(timeout)
 
-            proc.stdin.write(payload + "\n")
+
+def _extract_python_features(recording, timeout):
+    global _feature_worker_proc
+    with _feature_worker_lock:
+        proc = _start_feature_worker_locked(timeout)
+        try:
+            proc.stdin.write(json.dumps({"recording": recording}, allow_nan=False) + "\n")
             proc.stdin.flush()
-            out = proc.stdout.readline()
+            line = _read_worker_line(proc, timeout)
+            if not line:
+                raise RuntimeError("Python tsfresh worker exited or timed out")
+            return json.loads(line)
+        except Exception:
+            if proc.poll() is None:
+                proc.terminate()
+            _feature_worker_proc = None
+            raise
 
-        total_time_ms = round((time.monotonic() - t0) * 1000, 2)
 
-        if not out:
-            # Jika proses mati mendadak, restart
-            with _snn_proc_lock:
-                _snn_proc = None
-            return {"ok": False, "error": "Rust SNN daemon process closed unexpectedly."}
+def _attach_power_summary(result, started, ended):
+    for key in ("kria_power_w", "kria_peak_power_w", "kria_vbus_v", "kria_energy_mj"):
+        result.pop(key, None)
+    with _kria_power_lock:
+        samples = [sample for sample in _kria_power_samples if started <= sample[0] <= ended]
+        status = _kria_power_status
+    result["power_sample_count"] = len(samples)
+    if not samples:
+        result["power_status"] = status if status != "ok" else "No power readings captured during inference"
+        return
+    average_power = sum(sample[3] for sample in samples) / len(samples)
+    result["kria_power_w"] = round(average_power, 4)
+    result["kria_peak_power_w"] = round(max(sample[3] for sample in samples), 4)
+    result["kria_vbus_v"] = round(sum(sample[1] for sample in samples) / len(samples), 4)
+    result["kria_energy_mj"] = round(average_power * (ended - started) * 1000.0, 4)
+    result["power_status"] = "ok"
 
-        res = json.loads(out)
-        if not res.get("ok"):
-            return res
 
-        gas_conf = res.get("gas_confidences", {})
-        pred_fault = res.get("predicted_fault", "Normal")
-        iec_diag = _diagnose_iec60599(gas_conf, pred_fault)
+def snn_rust_inference(recording, use_hw=True, timeout=60.0):
+    """Extract the model's Python tsfresh features, then run SNN/RF via Rust."""
+    environment = os.environ.copy()
+    environment["SNN_MODELS_DIR"] = SNN_MODELS_DIR
+    started = time.monotonic()
+    try:
+        feature_result = _extract_python_features(recording, timeout)
+        if not feature_result.get("ok"):
+            return {"ok": False, "error": feature_result.get("error", "Python tsfresh feature extraction failed")}
+        request = json.dumps({
+            "features": feature_result["features"],
+            "feature_ms": feature_result["feature_ms"],
+            "use_hw": use_hw,
+        }, allow_nan=False)
+        with _snn_runner_lock:
+            completed = subprocess.run(
+                [SNN_INFER_BIN], input=request + "\n", text=True,
+                capture_output=True, timeout=timeout, env=environment, check=False,
+            )
+        if completed.returncode != 0:
+            return {"ok": False, "error": f"SNN runner exited with code {completed.returncode}: {completed.stderr[-1000:]}"}
+        output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
+        if not output_lines:
+            return {"ok": False, "error": f"SNN runner returned no result: {completed.stderr[-1000:]}"}
+        result = json.loads(output_lines[-1])
+        if not result.get("ok"):
+            return result
 
-        # Samakan urutan output array untuk kompatibilitas frontend
-        gas_names = res.get("gas_names", ["C2H2", "C2H4", "CH4", "H2", "OTHER"])
-        outputs = [gas_conf.get(g, 0.0) / 100.0 for g in gas_names]
-
-        return {
-            "ok": True,
-            "outputs": outputs,
-            "gas_names": gas_names,
-            "gas_confidences": gas_conf,
-            "predicted_gas": res.get("predicted_gas"),
-            "predicted_idx": res.get("predicted_idx"),
-            "confidence": res.get("confidence"),
-            "predicted_fault": pred_fault,
-            "iec_diagnosis": iec_diag,
-            "feature_latency_ms": res.get("feature_ms", 0.0),
-            "latency_ms": res.get("latency_ms", 0.0),
-            "total_latency_ms": total_time_ms,
-            "mode": res.get("mode", "sw")
-        }
-    except Exception as e:
-        import traceback
-        with _snn_proc_lock:
-            _snn_proc = None
-        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
+        confidences = result.get("gas_confidences", {})
+        gas_names = result.get("gas_names", _gas_classes)
+        result["outputs"] = result.get("outputs") or [
+            float(confidences.get(name, 0.0)) / 100.0 for name in gas_names
+        ]
+        result["feature_latency_ms"] = result.get("feature_ms")
+        ended = time.monotonic()
+        result["total_latency_ms"] = round((ended - started) * 1000.0, 2)
+        _attach_power_summary(result, started, ended)
+        result["iec_diagnosis"] = _diagnose_iec60599(
+            confidences, result.get("predicted_fault")
+        )
+        result["hardware_requested"] = bool(use_hw)
+        return result
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"Inference pipeline timed out after {timeout:.1f}s"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Could not run SNN FPGA pipeline: {exc}"}
 
 
 def snn_fpga_inference(sensor_values):
@@ -168,7 +253,7 @@ def snn_fpga_inference(sensor_values):
             rec = list(_sensor_history)
         if len(rec) < 10:
             rec = [sensor_values for _ in range(10)]
-    return snn_rust_inference(rec, use_hw=False)
+    return snn_rust_inference(rec, use_hw=True)
 
 setpoint = 0.0
 fuzzy_controller = FuzzyPIDController(kp=5.0, ki=0.5, kd=1.0)
@@ -176,8 +261,6 @@ fuzzy_controller = FuzzyPIDController(kp=5.0, ki=0.5, kd=1.0)
 dev = None
 usb_lock = threading.Lock()
 shutdown_event = threading.Event()
-
-import subprocess
 
 RUST_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "persistence_rs", "target", "release", "persistence_rs")
 persister_proc = None
@@ -298,21 +381,25 @@ def _resolve_phase_ack(phase):
 
 async def run_system_plan(websocket, phases, pump_pwm):
     """Run all requested cycles on Kria so browser timer throttling cannot stall phases."""
-    global phase_task, phase_owner, phase_ack_future
+    global phase_task, phase_owner, phase_ack_future, _active_system_cycle
     phase_owner = websocket
     previous_cycle = None
     try:
         queue_command("SYSTEM_ARM")
         queue_command(f"PWM={pump_pwm}")
-        for item in phases:
+        for phase_index, item in enumerate(phases):
             if websocket not in clients or phase_owner is not websocket:
                 break
             cycle_number = item["cycle"]
+            _active_system_cycle = cycle_number
             phase = item["phase"]
             duration = item["duration_sec"]
             if cycle_number != previous_cycle:
                 queue_command(f"CYCLE={cycle_number}")
                 previous_cycle = cycle_number
+                if _cycle_inference_enabled and cycle_number >= _cycle_min_number:
+                    with _cycle_recordings_lock:
+                        _cycle_sample_events.setdefault(cycle_number, threading.Event()).clear()
             if phase == "INJECT":
                 queue_command(f"PWM={pump_pwm}")
 
@@ -322,10 +409,9 @@ async def run_system_plan(websocket, phases, pump_pwm):
             try:
                 acknowledged = await asyncio.wait_for(phase_ack_future, timeout=5.0)
             except asyncio.TimeoutError:
-                await broadcast_message(json.dumps({
-                    "type": "SYSTEM_ERROR",
-                    "message": f"The Teensy did not acknowledge the {phase} phase within 5 seconds.",
-                }))
+                await _abort_system_after_stream_failure(
+                    f"Teensy tidak mengakui fase {phase} dalam 5 detik. Periksa USB dan status Teensy."
+                )
                 return
             finally:
                 phase_ack_future = None
@@ -340,6 +426,37 @@ async def run_system_plan(websocket, phases, pump_pwm):
             }))
             await asyncio.sleep(duration)
 
+            # Run inference once, after the final planned phase in a cycle.
+            next_item = phases[phase_index + 1] if phase_index + 1 < len(phases) else None
+            if next_item is None or next_item["cycle"] != cycle_number:
+                if _cycle_inference_enabled and cycle_number >= _cycle_min_number:
+                    with _cycle_recordings_lock:
+                        event = _cycle_sample_events.setdefault(cycle_number, threading.Event())
+                        last_sequence = _cycle_last_sequence.get(cycle_number)
+                        overflowed = cycle_number in _cycle_overflowed
+                        event.clear()
+                    if not overflowed:
+                        got_final_frame = await asyncio.to_thread(event.wait, 3.0)
+                        with _cycle_recordings_lock:
+                            latest_sequence = _cycle_last_sequence.get(cycle_number)
+                        if not got_final_frame or latest_sequence is None or latest_sequence == last_sequence:
+                            message = (
+                                f"Cycle {cycle_number} dibatalkan: frame sensor penutup tidak diterima "
+                                "dalam 3 detik setelah fase terakhir. Periksa koneksi USB/Teensy dan stream sensor."
+                            )
+                            await _abort_system_after_stream_failure(message)
+                            return
+                        # Allow the USB reader to drain any bytes queued in the same transfer.
+                        await asyncio.sleep(0.05)
+                launch_cycle_inference(cycle_number)
+                with _cycle_recordings_lock:
+                    for old_cycle in [key for key in _cycle_recordings if key <= cycle_number]:
+                        _cycle_recordings.pop(old_cycle, None)
+                    _cycle_overflowed.discard(cycle_number)
+                    _cycle_last_sequence.pop(cycle_number, None)
+                    _cycle_sample_events.pop(cycle_number, None)
+                _active_system_cycle = None
+
         if phase_owner is websocket:
             await broadcast_message(json.dumps({"type": "SYSTEM_COMPLETE"}))
     except Exception as exc:
@@ -351,18 +468,106 @@ async def run_system_plan(websocket, phases, pump_pwm):
         if phase_owner is websocket:
             queue_command("PHASE=OFF")
             phase_owner = None
+        _active_system_cycle = None
         if phase_task is asyncio.current_task():
             phase_task = None
 
 
-def _abort_system_after_watchdog():
-    global phase_task, phase_owner, phase_active
-    if phase_task is not None and not phase_task.done():
-        phase_task.cancel()
-    phase_task = None
-    phase_owner = None
+def launch_cycle_inference(cycle_number):
+    if not _cycle_inference_enabled:
+        return
+    generation = _cycle_inference_generation
+    with _cycle_recordings_lock:
+        if cycle_number in _cycle_inference_launched:
+            print(f"Skipping duplicate cycle inference launch for cycle {cycle_number}")
+            return
+        _cycle_inference_launched.add(cycle_number)
+        recording = _cycle_recordings.pop(cycle_number, [])
+        overflowed = cycle_number in _cycle_overflowed
+        _cycle_overflowed.discard(cycle_number)
+        _cycle_last_sequence.pop(cycle_number, None)
+    task = asyncio.create_task(infer_completed_cycle(cycle_number, recording, generation, overflowed))
+    _cycle_inference_tasks.add(task)
+    task.add_done_callback(_cycle_inference_tasks.discard)
+
+
+async def infer_completed_cycle(cycle_number, recording, generation, overflowed=False):
+    try:
+        if overflowed:
+            result = {
+                "type": "SNN_RESULT", "ok": False,
+                "error": f"Cycle {cycle_number} melewati batas {MAX_CYCLE_SAMPLES} sampel; inference cycle dibatalkan.",
+                "cycle": cycle_number, "inference_mode": "cycle",
+            }
+        elif len(recording) < 10:
+            result = {
+                "type": "SNN_RESULT", "ok": False,
+                "error": f"Cycle {cycle_number} hanya memiliki {len(recording)} sampel; minimal 10 diperlukan.",
+                "cycle": cycle_number, "inference_mode": "cycle",
+            }
+        else:
+            loop = asyncio.get_running_loop()
+            async with inference_gate:
+                result = await loop.run_in_executor(None, snn_fpga_inference_safe, recording)
+            result.update({"type": "SNN_RESULT", "cycle": cycle_number, "inference_mode": "cycle"})
+    except Exception as exc:
+        result = {
+            "type": "SNN_RESULT", "ok": False,
+            "error": f"Cycle {cycle_number} inference gagal: {exc}",
+            "cycle": cycle_number, "inference_mode": "cycle",
+        }
+    result["cycle_sample_count"] = len(recording)
+    if generation == _cycle_inference_generation and _cycle_inference_enabled:
+        await broadcast_cycle_result(result)
+
+
+async def broadcast_cycle_result(result):
+    payload = json.dumps(result)
+    stale = []
+    for client in tuple(_cycle_result_clients):
+        try:
+            await client.send(payload)
+        except Exception:
+            stale.append(client)
+    for client in stale:
+        _cycle_result_clients.discard(client)
+
+
+def _notify_serial_stream_failure(message):
+    """Schedule a single system-plan abort from the USB reader thread."""
+    global _stream_failure_reported
+    if phase_task is None or phase_task.done() or _stream_failure_reported:
+        return
+    _stream_failure_reported = True
+    asyncio.create_task(_abort_system_after_stream_failure(message))
+
+
+async def _abort_system_after_stream_failure(message):
+    global phase_task, phase_owner, phase_active, _active_system_cycle
+    cycle_number = _active_system_cycle
+    task = phase_task
+    if task is not None and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+    queue_command("PHASE=OFF")
     with command_condition:
         phase_active = False
+        command_condition.notify_all()
+    await broadcast_message(json.dumps({"type": "SYSTEM_ERROR", "message": message}))
+    if cycle_number is not None and _cycle_inference_enabled:
+        await broadcast_cycle_result({
+            "type": "SNN_RESULT", "ok": False, "error": message,
+            "cycle": cycle_number, "inference_mode": "cycle",
+        })
+    with _cycle_recordings_lock:
+        if cycle_number is not None:
+            _cycle_recordings.pop(cycle_number, None)
+            _cycle_last_sequence.pop(cycle_number, None)
+            _cycle_overflowed.discard(cycle_number)
+            _cycle_sample_events.pop(cycle_number, None)
+    if task is None or task.done():
+        phase_task = None
+        phase_owner = None
+        _active_system_cycle = None
 
 
 def connect_serial():
@@ -502,25 +707,15 @@ def generate_gnuplot_graph(data, baselines, session_name, sensor_names):
     }
 
 
-def _snn_worker(sensor_values, result_queue):
-    try:
-        result_queue.put(snn_fpga_inference(sensor_values))
-    except BaseException as exc:
-        result_queue.put({"ok": False, "error": repr(exc)})
-
 def snn_fpga_inference_safe(sensor_values, timeout=8.0):
-    ctx=mp.get_context("fork")
-    result_queue=ctx.Queue(maxsize=1)
-    proc=ctx.Process(target=_snn_worker, args=(sensor_values, result_queue), daemon=True)
-    proc.start()
-    proc.join(timeout)
-    if proc.is_alive():
-        proc.terminate()
-        proc.join(2.0)
-        if proc.is_alive(): proc.kill()
-        return {"ok": False, "error": f"FPGA inference watchdog timeout after {timeout:.1f}s"}
-    if not result_queue.empty(): return result_queue.get()
-    return {"ok": False, "error": f"FPGA worker exited with code {proc.exitcode}"}
+    recording = sensor_values
+    if not (isinstance(recording, list) and recording and isinstance(recording[0], list)):
+        update_sensor_history(sensor_values)
+        with _sensor_history_lock:
+            recording = list(_sensor_history)
+    if len(recording) < 10:
+        return {"ok": False, "error": f"Inference requires at least 10 sensor frames; received {len(recording)}"}
+    return snn_rust_inference(recording, use_hw=True, timeout=max(timeout, 60.0))
 
 async def handler(websocket):
     global setpoint, fuzzy_controller, phase_active, phase_owner, phase_task
@@ -548,6 +743,7 @@ async def handler(websocket):
                         continue
 
                     if cmd.get('type') == 'START_SYSTEM_PLAN':
+                        global _stream_failure_reported
                         if phase_task is not None and not phase_task.done():
                             raise ValueError("A system run is already active. Stop it before starting another run.")
                         phases = cmd.get('phases')
@@ -565,6 +761,13 @@ async def handler(websocket):
                             if phase not in valid_phases or cycle < 1 or duration_sec < 1:
                                 raise ValueError("Invalid phase, cycle number, or phase duration in the system plan.")
                             plan.append({"phase": phase, "cycle": cycle, "duration_sec": duration_sec})
+                        with _cycle_recordings_lock:
+                            _cycle_recordings.clear()
+                            _cycle_last_sequence.clear()
+                            _cycle_overflowed.clear()
+                            _cycle_sample_events.clear()
+                            _cycle_inference_launched.clear()
+                        _stream_failure_reported = False
                         phase_task = asyncio.create_task(run_system_plan(websocket, plan, pump_pwm))
                         await websocket.send(json.dumps({"type": "SYSTEM_PLAN_ACCEPTED", "phases": len(plan)}))
                         continue
@@ -574,8 +777,43 @@ async def handler(websocket):
                             phase_task.cancel()
                         phase_task = None
                         phase_owner = None
+                        with _cycle_recordings_lock:
+                            _cycle_recordings.clear()
+                            _cycle_last_sequence.clear()
+                            _cycle_overflowed.clear()
+                            _cycle_sample_events.clear()
+                            _cycle_inference_launched.clear()
                         queue_command("PHASE=OFF")
                         await broadcast_message(json.dumps({"type": "SYSTEM_STOPPED"}))
+                        continue
+
+                    if cmd.get('type') == 'SET_CYCLE_INFERENCE':
+                        global _cycle_inference_enabled, _cycle_inference_generation, _cycle_min_number
+                        if cmd.get('enabled'):
+                            _cycle_inference_enabled = True
+                            _cycle_min_number = (_active_system_cycle + 1) if _active_system_cycle is not None else 1
+                            _cycle_result_clients.add(websocket)
+                        else:
+                            _cycle_inference_enabled = False
+                            _cycle_inference_generation += 1
+                            _cycle_min_number = 1
+                            _cycle_result_clients.clear()
+                            with _cycle_recordings_lock:
+                                _cycle_recordings.clear()
+                                _cycle_last_sequence.clear()
+                                _cycle_overflowed.clear()
+                                _cycle_sample_events.clear()
+                        await websocket.send(json.dumps({
+                            "type": "CYCLE_INFERENCE_ACK", "enabled": _cycle_inference_enabled
+                        }))
+                        continue
+
+                    if cmd.get('type') == 'GET_CYCLE_INFERENCE':
+                        if _cycle_inference_enabled:
+                            _cycle_result_clients.add(websocket)
+                        await websocket.send(json.dumps({
+                            "type": "CYCLE_INFERENCE_ACK", "enabled": _cycle_inference_enabled
+                        }))
                         continue
 
                     if cmd.get('type') == 'SAVE_GRAPH':
@@ -591,6 +829,8 @@ async def handler(websocket):
                         rows = cmd.get('rows', [])
                         await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'validating','progress':10,'message':'Validating CSV data'}))
                         if len(rows) < 10: raise ValueError(f"CSV membutuhkan minimal 10 baris sensor, diterima {len(rows)}")
+                        if len(rows) > MAX_CYCLE_SAMPLES:
+                            raise ValueError(f"CSV maksimal {MAX_CYCLE_SAMPLES} baris, diterima {len(rows)}")
                         request_t0 = time.monotonic()
                         # Ambil nilai mos0..mos15 (mV) dari dictionary rows
                         recording = []
@@ -598,23 +838,18 @@ async def handler(websocket):
                             row_mos = [float(r.get(f"mos{i}", r.get(f"mos{i}_mV", r.get(f"MOS{i}", 0.0)))) for i in range(16)]
                             recording.append(row_mos)
 
-                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'fpga','progress':50,'message':'Running SNN Rust Inference'}))
+                        await websocket.send(json.dumps({'type':'CSV_PROGRESS','stage':'fpga','progress':50,'message':'Running SNN Inference'}))
                         loop = asyncio.get_running_loop()
-                        result = await loop.run_in_executor(None, snn_rust_inference, recording)
-                        result['total_latency_ms'] = round((time.monotonic() - request_t0) * 1000, 2)
-                        
-                        # Baca snapshot daya Kria saat inferensi selesai
-                        try:
-                            with open("/sys/class/hwmon/hwmon0/power1_input", "r") as f:
-                                result['kria_power_w'] = round(float(f.read().strip()) / 1e6, 3)
-                            with open("/sys/class/hwmon/hwmon0/in1_input", "r") as f:
-                                result['kria_vbus_v'] = round(float(f.read().strip()) / 1000.0, 3)
-                            with open("/sys/class/hwmon/hwmon0/curr1_input", "r") as f:
-                                result['kria_current_a'] = round(float(f.read().strip()) / 1000.0, 3)
-                        except Exception:
-                            result['kria_power_w'] = None
+                        result = await loop.run_in_executor(
+                            None, snn_rust_inference, recording, True, 120.0
+                        )
+                        request_end = time.monotonic()
+                        result['total_latency_ms'] = round((request_end - request_t0) * 1000, 2)
+                        if result.get('ok'):
+                            _attach_power_summary(result, request_t0, request_end)
 
                         result['type'] = 'SNN_RESULT'
+                        result['inference_mode'] = 'csv'
                         await websocket.send(json.dumps(result))
 
                     if cmd.get('type') == 'SNN_INFER':
@@ -648,6 +883,7 @@ async def handler(websocket):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
+        _cycle_result_clients.discard(websocket)
         clients.remove(websocket)
         with command_condition:
             if phase_active and phase_owner is websocket:
@@ -713,18 +949,32 @@ def serial_read_loop(loop, outbound_queue):
                             if phase_ack:
                                 loop.call_soon_threadsafe(_resolve_phase_ack, phase_ack.group(1))
                             if decoded == "SYSTEM_WATCHDOG=TRIPPED":
-                                loop.call_soon_threadsafe(_abort_system_after_watchdog)
+                                loop.call_soon_threadsafe(
+                                    _notify_serial_stream_failure,
+                                    "Teensy watchdog menghentikan system run. Periksa heartbeat dan koneksi USB sebelum mencoba lagi."
+                                )
                             if decoded.startswith("SAMPLE,"):
-                                try:
-                                    flds = decoded.split(",")
-                                    # Format SAMPLE: timestamp, cycle?, mos0..mos15, ...
-                                    # Sensor MOS ada di urutan kolom sensor
-                                    start_idx = 2 if len(flds) >= 35 else 1
-                                    mos_vals = [float(x) for x in flds[start_idx:start_idx+16]]
-                                    if len(mos_vals) == 16:
-                                        update_sensor_history(mos_vals)
-                                except Exception:
-                                    pass
+                                parsed = parse_sensor_sample_frame(decoded)
+                                if parsed:
+                                    cycle_number, sequence, mos_counts = parsed
+                                    mos_vals_mv = [value * ADC_COUNT_TO_MV for value in mos_counts]
+                                    update_sensor_history(mos_vals_mv)
+                                    if cycle_number > 0:
+                                        with _cycle_recordings_lock:
+                                            if _cycle_inference_enabled and cycle_number >= _cycle_min_number:
+                                                sample_event = _cycle_sample_events.setdefault(cycle_number, threading.Event())
+                                                if cycle_number not in _cycle_overflowed:
+                                                    last_sequence = _cycle_last_sequence.get(cycle_number)
+                                                    if last_sequence is None or sequence > last_sequence:
+                                                        _cycle_last_sequence[cycle_number] = sequence
+                                                        rows = _cycle_recordings.setdefault(cycle_number, [])
+                                                        if len(rows) >= MAX_CYCLE_SAMPLES:
+                                                            _cycle_recordings.pop(cycle_number, None)
+                                                            _cycle_overflowed.add(cycle_number)
+                                                            _cycle_last_sequence.pop(cycle_number, None)
+                                                        else:
+                                                            rows.append(mos_vals_mv)
+                                                            sample_event.set()
                             # Enqueue for persistence (non-blocking)
                             try:
                                 persist_queue.put_nowait(decoded)
@@ -740,6 +990,10 @@ def serial_read_loop(loop, outbound_queue):
                     break
                 else:
                     print(f"USB read error: {e}")
+                    loop.call_soon_threadsafe(
+                        _notify_serial_stream_failure,
+                        f"Koneksi USB sensor terputus saat system run: {e}"
+                    )
                     dev = None
                     buffer.clear()  # Clear stale bytes to prevent frame contamination on reconnect
                     time.sleep(1)
@@ -747,6 +1001,10 @@ def serial_read_loop(loop, outbound_queue):
                 if shutdown_event.is_set():
                     break
                 print(f"USB disconnected or error: {e}")
+                loop.call_soon_threadsafe(
+                    _notify_serial_stream_failure,
+                    f"Koneksi USB sensor terputus saat system run: {e}"
+                )
                 dev = None
                 buffer.clear()  # Clear stale bytes to prevent frame contamination on reconnect
                 time.sleep(1)
@@ -756,28 +1014,64 @@ def serial_read_loop(loop, outbound_queue):
 
 async def kria_power_loop():
     import glob
+    global _kria_power_hwmon, _kria_power_status
+    next_broadcast = 0.0
+    next_scan = 0.0
     while not shutdown_event.is_set():
+        now = time.monotonic()
         try:
-            base = None
-            for d in glob.glob("/sys/class/hwmon/hwmon*"):
-                try:
-                    with open(os.path.join(d, "name"), "r") as f:
-                        if "ina260" in f.read():
-                            base = d
+            if _kria_power_hwmon is None or now >= next_scan or not os.path.isdir(_kria_power_hwmon):
+                _kria_power_hwmon = None
+                next_scan = now + 5.0
+                for candidate in glob.glob("/sys/class/hwmon/hwmon*"):
+                    try:
+                        with open(os.path.join(candidate, "name"), "r") as f:
+                            chip = f.read().strip().lower()
+                        if chip.startswith("ina"):
+                            _kria_power_hwmon = candidate
                             break
-                except: pass
-            if base:
-                with open(os.path.join(base, "in1_input"), "r") as f:
-                    v = float(f.read().strip()) / 1000.0
-                with open(os.path.join(base, "curr1_input"), "r") as f:
-                    i = float(f.read().strip()) / 1000.0
-                with open(os.path.join(base, "power1_input"), "r") as f:
-                    p = float(f.read().strip()) / 1e6
-                msg = f"KRIA Vbus={v:.3f}V I={i:.3f}A P={p:.3f}W"
-                await broadcast_message(msg)
-        except Exception:
-            pass
-        await asyncio.sleep(1.0)
+                    except OSError:
+                        continue
+            if _kria_power_hwmon is None:
+                raise FileNotFoundError("No INA-family hwmon device found")
+
+            v = _read_hwmon_float(_kria_power_hwmon, ("in1_input",)) / 1000.0
+            i = _read_hwmon_float(_kria_power_hwmon, ("curr1_input",)) / 1000.0
+            p = _read_hwmon_float(_kria_power_hwmon, ("power1_input",)) / 1e6
+            sample_time = time.monotonic()
+            with _kria_power_lock:
+                _kria_power_samples.append((sample_time, v, i, p))
+                _kria_power_status = "ok"
+            if sample_time >= next_broadcast:
+                await broadcast_message(f"KRIA Vbus={v:.3f}V I={i:.3f}A P={p:.3f}W")
+                next_broadcast = sample_time + 1.0
+        except Exception as exc:
+            with _kria_power_lock:
+                _kria_power_status = str(exc)
+        await asyncio.sleep(0.1)
+
+
+def stop_snn_feature_worker():
+    global _feature_worker_proc
+    with _feature_worker_lock:
+        if _feature_worker_proc is not None:
+            if _feature_worker_proc.poll() is None:
+                _feature_worker_proc.terminate()
+                try:
+                    _feature_worker_proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    _feature_worker_proc.kill()
+            _feature_worker_proc = None
+
+def _read_hwmon_float(base, candidates):
+    for filename in candidates:
+        try:
+            with open(os.path.join(base, filename), "r") as f:
+                return float(f.read().strip())
+        except (OSError, ValueError):
+            continue
+    raise FileNotFoundError(f"Missing hwmon channel: {', '.join(candidates)}")
+
 
 def enqueue_serial_message(outbound_queue, msg):
     if outbound_queue.full():
@@ -813,6 +1107,14 @@ async def main():
     writer.start()
 
     try:
+        async def warm_worker_in_background():
+            try:
+                await asyncio.to_thread(warm_snn_feature_worker, 60.0)
+                print("Python tsfresh feature worker ready")
+            except Exception as exc:
+                print(f"Warning: Python tsfresh worker not ready: {exc}")
+
+        asyncio.create_task(warm_worker_in_background())
         print("WebSocket server running on ws://0.0.0.0:8080 (PyUSB mode)")
         asyncio.create_task(kria_power_loop())
         asyncio.create_task(serial_broadcast_worker(outbound_queue))
@@ -825,6 +1127,7 @@ async def main():
             command_condition.notify_all()
         if persister_proc:
             persister_proc.terminate()
+        stop_snn_feature_worker()
         close_serial()
         t.join(timeout=2)
         writer.join(timeout=2)

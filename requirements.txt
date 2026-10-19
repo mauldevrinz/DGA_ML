@@ -1,4 +1,6 @@
 numpy
+pandas
+tsfresh
 websockets
 pyusb
 requests
